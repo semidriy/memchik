@@ -1,0 +1,15 @@
+[Unit]
+Description=Memchik Media Server
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/memchik
+EnvironmentFile=/opt/memchik/.env
+ExecStart=/opt/memchik/.venv/bin/uvicorn media_server.app:app --host 127.0.0.1 --port 8090 --workers 4
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
