@@ -417,6 +417,29 @@ async def get_growth_stats(pool: Pool) -> dict:
     return dict(row)
 
 
+async def get_organic_growth(pool: Pool) -> dict:
+    """Саморост: новые юзеры, пришедшие НЕ по рекламной ссылке (органика), против
+    привлечённых рекламой. «Из рекламы» = у юзера есть хоть одна запись в link_visits;
+    «органика» = записей нет. Считаем за сегодня / 7д / 30д / всё время."""
+    row = await pool.fetchrow(
+        """
+        WITH lv AS (SELECT DISTINCT user_id FROM link_visits)
+        SELECT
+            COUNT(*)                                                                          AS total,
+            COUNT(*) FILTER (WHERE lv.user_id IS NULL)                                        AS organic_total,
+            COUNT(*) FILTER (WHERE u.created_at::date = NOW()::date)                           AS new_today,
+            COUNT(*) FILTER (WHERE u.created_at::date = NOW()::date AND lv.user_id IS NULL)     AS organic_today,
+            COUNT(*) FILTER (WHERE u.created_at >= NOW() - INTERVAL '7 days')                  AS new_week,
+            COUNT(*) FILTER (WHERE u.created_at >= NOW() - INTERVAL '7 days' AND lv.user_id IS NULL)  AS organic_week,
+            COUNT(*) FILTER (WHERE u.created_at >= NOW() - INTERVAL '30 days')                 AS new_month,
+            COUNT(*) FILTER (WHERE u.created_at >= NOW() - INTERVAL '30 days' AND lv.user_id IS NULL) AS organic_month
+        FROM users u
+        LEFT JOIN lv ON lv.user_id = u.id
+        """
+    )
+    return dict(row)
+
+
 async def get_top_templates(pool: Pool, limit: int = 5) -> list[dict]:
     rows = await pool.fetch(
         """
@@ -754,9 +777,13 @@ async def delete_template(pool: Pool, template_id: int):
 async def add_user_template(
     pool: Pool, file_id: str, file_unique_id: str, file_type: str,
     title: str, submitted_by: int, is_public: bool,
+    content_hash: str | None = None,
 ) -> dict | None:
     """Returns None if duplicate:
-    - public: same file_unique_id already exists as any public template (active or pending)
+    - public: same file (matched by file_unique_id OR content_hash) already exists as any
+      public template from ANY user. content_hash (sha256 of the raw bytes) catches the
+      case where a different user re-uploaded the same gif — Telegram then assigns a fresh
+      file_unique_id, so file_unique_id alone would let the cross-user copy through.
     - personal: same user already has this file_unique_id as personal template
     """
     if is_public:
@@ -764,23 +791,26 @@ async def add_user_template(
         # so we don't create a duplicate and don't hit the unique constraint.
         rejected_id = await pool.fetchval(
             """SELECT id FROM templates
-               WHERE file_unique_id = $1 AND is_public = TRUE AND moderation_status = 'rejected'""",
-            file_unique_id,
+               WHERE is_public = TRUE AND moderation_status = 'rejected'
+                 AND (file_unique_id = $1 OR ($2::text IS NOT NULL AND content_hash = $2))""",
+            file_unique_id, content_hash,
         )
         if rejected_id:
             row = await pool.fetchrow(
                 """UPDATE templates
-                   SET file_id=$1, file_type=$2, title=$3, submitted_by=$4,
+                   SET file_id=$1, file_type=$2, title=$3, submitted_by=$4, content_hash=$6,
                        moderation_status='pending', is_active=FALSE, moderation_comment=NULL
                    WHERE id=$5 RETURNING *""",
-                file_id, file_type, title, submitted_by, rejected_id,
+                file_id, file_type, title, submitted_by, rejected_id, content_hash,
             )
             return dict(row)
-        # Only one public copy of a given file allowed (pending or approved)
+        # Only one public copy of a given file allowed (pending or approved), regardless
+        # of who submitted it — matched by stable file id OR by content hash.
         existing = await pool.fetchval(
             """SELECT id FROM templates
-               WHERE file_unique_id = $1 AND is_public = TRUE""",
-            file_unique_id,
+               WHERE is_public = TRUE
+                 AND (file_unique_id = $1 OR ($2::text IS NOT NULL AND content_hash = $2))""",
+            file_unique_id, content_hash,
         )
     else:
         # Only one personal copy of a given file per user (independent from public)
@@ -799,12 +829,12 @@ async def add_user_template(
             """
             INSERT INTO templates
               (file_id, file_unique_id, file_type, title, tags,
-               submitted_by, is_public, moderation_status, is_active)
-            VALUES ($1,$2,$3,$4,'{}', $5,$6,$7,$8)
+               submitted_by, is_public, moderation_status, is_active, content_hash)
+            VALUES ($1,$2,$3,$4,'{}', $5,$6,$7,$8,$9)
             RETURNING *
             """,
             file_id, file_unique_id, file_type, title,
-            submitted_by, is_public, status, active,
+            submitted_by, is_public, status, active, content_hash,
         )
     except asyncpg.UniqueViolationError:
         return None
@@ -855,6 +885,7 @@ async def increment_template_use_count(pool: Pool, template_id: int):
 # --- Bot messages & buttons ---
 
 import json as _json
+import re as _re
 
 
 def _from_jsonb(val) -> list | dict:
@@ -864,6 +895,95 @@ def _from_jsonb(val) -> list | dict:
     if isinstance(val, (list, dict)):
         return val
     return _json.loads(val)
+
+
+# HTML-теги, которые Телеграм умеет как message entities.
+_HTML_ENTITY_TAGS = {
+    "b": "bold", "strong": "bold",
+    "i": "italic", "em": "italic",
+    "u": "underline", "ins": "underline",
+    "s": "strikethrough", "strike": "strikethrough", "del": "strikethrough",
+    "code": "code", "pre": "pre",
+    "a": "text_link",
+    "tg-spoiler": "spoiler",
+    "blockquote": "blockquote",
+}
+_TAG_RE = _re.compile(r"</?([a-zA-Z][a-zA-Z0-9-]*)((?:\s[^>]*)?)>")
+_HREF_RE = _re.compile(r"""href\s*=\s*["']([^"']*)["']""")
+
+
+def _u16(s: str) -> int:
+    """Длина строки в UTF-16 code units — в них Телеграм считает offset/length энтитей."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _html_to_entities(text: str, base_entities: list) -> tuple[str, list]:
+    """Превратить HTML-теги (<b>, <i>, <a href>…) в message entities и слить их с уже
+    имеющимися (прем-эмодзи и пр.). Возвращает (чистый_текст_без_тегов, список_энтитей).
+
+    Зачем: Телеграм НЕ принимает parse_mode=HTML вместе с entities. У менюшек с
+    прем-эмодзи entities есть всегда, поэтому раньше голые <b> уходили как обычный
+    текст и показывались тегами. Теперь теги конвертируются в энтити, а офсеты
+    base_entities сдвигаются на вырезанные теги. Всё в UTF-16, как требует Bot API."""
+    base_entities = list(base_entities or [])
+    if "<" not in (text or ""):
+        return text or "", base_entities
+
+    out: list[str] = []
+    entities: list[dict] = []
+    stack: list[tuple] = []           # (etype, clean_start_u16, extra)
+    cuts: list[tuple[int, int]] = []  # (raw_start_u16, removed_len_u16) — для сдвига base
+    raw_u16 = clean_u16 = 0
+    i, n = 0, len(text)
+    while i < n:
+        m = _TAG_RE.match(text, i) if text[i] == "<" else None
+        if not m:
+            ch = text[i]
+            c = _u16(ch)
+            out.append(ch)
+            clean_u16 += c
+            raw_u16 += c
+            i += 1
+            continue
+        name = m.group(1).lower()
+        etype = _HTML_ENTITY_TAGS.get(name)
+        full = m.group(0)
+        flen = _u16(full)
+        if etype is None:
+            # неизвестный тег — оставляем как есть (это просто текст)
+            out.append(full)
+            clean_u16 += flen
+            raw_u16 += flen
+            i = m.end()
+            continue
+        cuts.append((raw_u16, flen))
+        if full.startswith("</"):
+            for k in range(len(stack) - 1, -1, -1):
+                if stack[k][0] == etype:
+                    et, start, extra = stack.pop(k)
+                    if clean_u16 > start:
+                        ent = {"type": et, "offset": start, "length": clean_u16 - start}
+                        ent.update(extra)
+                        entities.append(ent)
+                    break
+        else:
+            extra = {}
+            if etype == "text_link":
+                hm = _HREF_RE.search(m.group(2) or "")
+                extra["url"] = hm.group(1) if hm else ""
+            stack.append((etype, clean_u16, extra))
+        raw_u16 += flen
+        i = m.end()
+
+    clean = "".join(out)
+    for be in base_entities:
+        o = be.get("offset", 0)
+        shift = sum(l for (s, l) in cuts if s < o)
+        nb = dict(be)
+        nb["offset"] = o - shift
+        entities.append(nb)
+    entities.sort(key=lambda e: (e["offset"], -e["length"]))
+    return clean, entities
 
 
 _MSG_DEFAULTS: dict[str, str] = {
@@ -877,6 +997,11 @@ _MSG_DEFAULTS: dict[str, str] = {
     "meme_send_text": "✏️ Напиши текст для наложения (до 100 символов):",
     "settings": "⚙️ Настройки",
     "premium": "💎 <b>Гифыч Premium</b>\n\nОтключи рекламу и показы навсегда.",
+    "tpl.add_choose_type": (
+        "🖼 Каким способом добавить шаблон?\n\n"
+        "⚡ <b>Быстро (только для вас)</b> — сразу доступен, не проходит модерацию.\n\n"
+        "🌐 <b>Публичный</b> — проходит модерацию, после одобрения виден всем."
+    ),
 }
 
 _BTN_DEFAULTS: dict[str, list] = {
@@ -908,23 +1033,103 @@ _BTN_DEFAULTS: dict[str, list] = {
     ],
 }
 
+# English fallbacks for menu texts/buttons so selecting English actually switches the
+# whole UI even before an admin enters per-language overrides in the admin panel.
+_MSG_DEFAULTS_EN: dict[str, str] = {
+    "welcome": (
+        "🌐 Hi! I'm a bot that overlays text onto meme templates.\n\n"
+        "To put text at the bottom of a template, separate phrases with a period.\n"
+        "A detailed video guide for @гифыч is attached to this message."
+    ),
+    "op_required": "👋 Hi! Subscribe to our channels to get access:",
+    "op_passed": "✅ Great, {name}!\n\n🌐 Use @гифыч in any chat and pick a template.",
+    "meme_send_text": "✏️ Type the overlay text (up to 100 characters):",
+    "settings": "⚙️ Settings",
+    "premium": "💎 <b>Gifych Premium</b>\n\nTurn off ads and promos forever.",
+    "tpl.add_choose_type": (
+        "🖼 How do you want to add a template?\n\n"
+        "⚡ <b>Quick (only for you)</b> — available instantly, no moderation.\n\n"
+        "🌐 <b>Public</b> — goes through moderation, visible to everyone once approved."
+    ),
+}
+
+_BTN_DEFAULTS_EN: dict[str, list] = {
+    "main_menu": [
+        [{"text": "🖼 Add template", "callback_data": "template:add_user"}],
+        [{"text": "💎 Gifych Premium", "callback_data": "premium:open"}],
+        [
+            {"text": "📰 News ↗", "url": "https://t.me/your_news_channel"},
+            {"text": "📁 Templates ↗", "url": "https://t.me/your_media_channel"},
+        ],
+        [{"text": "⚙️ Settings", "callback_data": "settings:open"}],
+    ],
+    "settings_menu": [
+        [{"text": "🌐 Language", "callback_data": "settings:language"}],
+        [{"text": "🤖 Leave a complaint ↗", "url": "https://t.me/your_support_channel"}],
+        [{"text": "Buy ads in Gifych ↗", "url": "https://t.me/your_ads_channel"}],
+        [{"text": "⬅ Back", "callback_data": "settings:back"}],
+    ],
+    "premium_menu": [
+        [{"text": "💎 1 month — 9 ⭐", "callback_data": "premium:buy:1m:9"}],
+        [{"text": "💎 6 months — 15 ⭐", "callback_data": "premium:buy:6m:15"}],
+        [{"text": "💎 12 months — 27 ⭐", "callback_data": "premium:buy:12m:27"}],
+        [{"text": "💎 Forever — 49 ⭐", "callback_data": "premium:buy:999y:49"}],
+        [
+            {"text": "⭐ Buy Stars ↗", "url": "https://t.me/stars"},
+            {"text": "🎁 Gift", "callback_data": "premium:gift"},
+        ],
+        [{"text": "⬅ Back", "callback_data": "premium:back"}],
+    ],
+}
+
+
+def _msg_default(key: str, lang: str) -> str:
+    if lang == "en" and key in _MSG_DEFAULTS_EN:
+        return _MSG_DEFAULTS_EN[key]
+    return _MSG_DEFAULTS.get(key, "")
+
+
+def _btn_default(key: str, lang: str) -> list:
+    if lang == "en" and key in _BTN_DEFAULTS_EN:
+        return _BTN_DEFAULTS_EN[key]
+    return _BTN_DEFAULTS.get(key, [])
+
+
+def _msg_payload(text, entities, file_id, file_type) -> dict:
+    """Единый вид bot_message для рендера: HTML-теги в тексте превращаем в энтити и
+    сливаем с прем-эмодзи, чтобы менюшка показывалась с форматированием И эмодзи разом
+    (Телеграм не умеет parse_mode=HTML + entities одновременно)."""
+    clean, ents = _html_to_entities(text or "", entities or [])
+    return {"text": clean, "entities": ents, "file_id": file_id, "file_type": file_type}
+
 
 async def get_bot_message(pool: Pool, key: str, lang: str = "ru") -> dict:
     row = await pool.fetchrow(
         "SELECT text, entities, file_id, file_type FROM bot_messages WHERE key = $1 AND lang = $2",
         key, lang,
     )
+    # No per-language override. If we ship a default for this language, prefer its TEXT
+    # over the RU DB row (иначе англ. юзер увидел бы русский текст), но МЕДИА наследуем
+    # из RU-строки — видео/гиф у менюшки обычно языконезависимое, не теряем его.
+    if not row and lang == "en" and key in _MSG_DEFAULTS_EN:
+        ru_media = await pool.fetchrow(
+            "SELECT file_id, file_type FROM bot_messages WHERE key = $1 AND lang = 'ru'", key,
+        )
+        return _msg_payload(
+            _MSG_DEFAULTS_EN[key], [],
+            ru_media["file_id"] if ru_media else None,
+            ru_media["file_type"] if ru_media else None,
+        )
     if not row and lang != "ru":
         row = await pool.fetchrow(
             "SELECT text, entities, file_id, file_type FROM bot_messages WHERE key = $1 AND lang = 'ru'",
             key,
         )
     if row:
-        return {
-            "text": row["text"], "entities": _from_jsonb(row["entities"]),
-            "file_id": row["file_id"], "file_type": row["file_type"],
-        }
-    return {"text": _MSG_DEFAULTS.get(key, ""), "entities": [], "file_id": None, "file_type": None}
+        return _msg_payload(
+            row["text"], _from_jsonb(row["entities"]), row["file_id"], row["file_type"],
+        )
+    return _msg_payload(_msg_default(key, lang), [], None, None)
 
 
 async def set_bot_message(pool: Pool, key: str, text: str, entities: list, lang: str = "ru"):
@@ -948,13 +1153,14 @@ async def set_bot_message_media(pool: Pool, key: str, file_id: str | None,
             key, lang,
         )
         return
+    # На вставке (новая строка) текст/энтити дефолтные; на конфликте трогаем ТОЛЬКО
+    # медиа, поэтому существующий текст не теряется. Подзапросы за text/entities тут не
+    # нужны — а их $1 в двух ролях (varchar-значение и text в COALESCE) раньше ломал
+    # вывод типа параметра (AmbiguousParameterError: text и character varying).
     await pool.execute(
         """
         INSERT INTO bot_messages (key, lang, text, entities, file_id, file_type)
-        VALUES ($1, $2,
-                COALESCE((SELECT text FROM bot_messages WHERE key = $1 AND lang = $2), ''),
-                COALESCE((SELECT entities FROM bot_messages WHERE key = $1 AND lang = $2), '[]'::jsonb),
-                $3, $4)
+        VALUES ($1, $2, '', '[]'::jsonb, $3, $4)
         ON CONFLICT (key, lang) DO UPDATE SET file_id = EXCLUDED.file_id, file_type = EXCLUDED.file_type
         """,
         key, lang, file_id, file_type,
@@ -980,13 +1186,15 @@ async def get_bot_buttons(pool: Pool, key: str, lang: str = "ru") -> list:
     row = await pool.fetchrow(
         "SELECT rows FROM bot_buttons WHERE key = $1 AND lang = $2", key, lang,
     )
+    if not row and lang == "en" and key in _BTN_DEFAULTS_EN:
+        return _BTN_DEFAULTS_EN[key]
     if not row and lang != "ru":
         row = await pool.fetchrow(
             "SELECT rows FROM bot_buttons WHERE key = $1 AND lang = 'ru'", key,
         )
     if row:
         return _from_jsonb(row["rows"])
-    return _BTN_DEFAULTS.get(key, [])
+    return _btn_default(key, lang)
 
 
 async def set_bot_buttons(pool: Pool, key: str, rows: list, lang: str = "ru"):
@@ -1310,13 +1518,21 @@ async def get_all_i18n_strings(pool: Pool, lang: str = "ru") -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def seed_i18n_defaults(pool: Pool, defaults: dict[str, str]) -> None:
-    """Insert missing default RU strings into i18n_strings. Skip existing."""
-    for key, value in defaults.items():
-        await pool.execute(
-            """
-            INSERT INTO i18n_strings (key, lang, value) VALUES ($1, 'ru', $2)
-            ON CONFLICT (key, lang) DO NOTHING
-            """,
-            key, value,
-        )
+async def seed_i18n_defaults(pool: Pool, defaults: dict) -> None:
+    """Insert missing default UI strings into i18n_strings, skipping existing rows.
+
+    Accepts either the legacy flat {key: value} (seeded as RU) or the new
+    {lang: {key: value}} shape so every shipped language (ru, en, …) is seeded."""
+    if defaults and all(isinstance(v, dict) for v in defaults.values()):
+        by_lang = defaults
+    else:
+        by_lang = {"ru": defaults}
+    for lang, mapping in by_lang.items():
+        for key, value in mapping.items():
+            await pool.execute(
+                """
+                INSERT INTO i18n_strings (key, lang, value) VALUES ($1, $2, $3)
+                ON CONFLICT (key, lang) DO NOTHING
+                """,
+                key, lang, value,
+            )

@@ -2,7 +2,7 @@ import logging
 import aiohttp
 
 from aiogram import Router, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     Message, CallbackQuery, ChatJoinRequest, MessageEntity,
@@ -24,6 +24,13 @@ from bot.states.admin import MemeStates
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+
+@router.message(Command("ver"))
+async def cmd_ver(message: Message):
+    """Показать версию бота — чтобы проверять, что обнова приехала на сервер."""
+    from bot.version import BOT_VERSION
+    await message.answer(f"🤖 Версия: <code>{BOT_VERSION}</code>", parse_mode="HTML")
 
 
 async def _check_bot_started(token: str, user_id: int) -> bool:
@@ -59,7 +66,10 @@ async def _send_bot_message(message: Message, msg: dict, kb, **fmt):
     if file_id:
         kw = {"caption": text or None, "reply_markup": kb}
         if entities:
+            # parse_mode=None обязателен: дефолт бота — HTML, иначе caption_entities
+            # игнорируются (теряются формат и прем-эмодзи).
             kw["caption_entities"] = entities
+            kw["parse_mode"] = None
         else:
             kw["parse_mode"] = "HTML"
         if file_type == "video":

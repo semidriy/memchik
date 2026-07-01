@@ -30,7 +30,10 @@ def _msg_entities(msg: dict):
 def _input_media(file_type: str | None, file_id: str, caption: str, entities):
     kw = {"media": file_id, "caption": caption or None}
     if entities:
+        # parse_mode=None обязателен: дефолт бота — HTML, иначе caption_entities
+        # игнорируются (теряются формат и прем-эмодзи).
         kw["caption_entities"] = entities
+        kw["parse_mode"] = None
     else:
         kw["parse_mode"] = "HTML"
     if file_type == "video":
@@ -44,6 +47,7 @@ async def _answer_media(message: Message, file_type: str | None, file_id: str, c
     kw = {"caption": caption or None, "reply_markup": kb}
     if entities:
         kw["caption_entities"] = entities
+        kw["parse_mode"] = None
     else:
         kw["parse_mode"] = "HTML"
     if file_type == "video":

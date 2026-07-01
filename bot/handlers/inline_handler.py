@@ -30,7 +30,7 @@ from bot.database.queries import (
     is_user_bot_premium,
 )
 from bot.services.query_parser import parse_inline_query
-from bot.services.inline_processor import build_preview_url, _sign
+from bot.services.inline_processor import build_preview_url, build_media_url, _sign
 from bot.services.i18n import t, user_lang
 
 router = Router()
@@ -104,14 +104,21 @@ def _result_markup(placement: dict | None, next_label: str = "🔁 Ещё мем
 
 
 def _build_preview_result(template: dict, overlay_text: str, placement: dict | None, next_label: str = "🔁 Ещё мем"):
-    """Inline result = static JPEG (first frame + text). Cheap; Telegram fetches the URL.
-    For animation templates this is swapped for the live gif after selection."""
+    """Inline result WITH overlay text — ВСЕГДА дешёвое статичное JPEG-превью (текст впечён).
+
+    Почему не отдаём сразу анимацию через mpeg4_url: на каждую букву Телеграм при ответе
+    тянет URL КАЖДОГО результата к себе. mpeg4_url запускает ffmpeg-рендер видео (~1-3 с
+    на штуку) — медиасервер не успевает отдать 50 свежих видео в отведённое Телеграму
+    окно, и тот выбрасывает все кроме 1-2. Поэтому в выдаче — статичные превью (PIL,
+    ~10-50 мс), их Телеграм успевает забрать все → видно ВСЕ гифки. Для animation-шаблонов
+    после выбора подменяем превью на живую гифку в handle_chosen_inline (там это ОДИН
+    рендер выбранного, а не 50 на каждый ввод)."""
     title = template["title"] or "GIF"
     if overlay_text:
         title = f'"{overlay_text}" • {title}'
     caption = placement["caption_text"] if placement and placement.get("caption_text") else None
-    url = build_preview_url(template["id"], overlay_text)
     rid = _encode_result_id(template["id"], overlay_text, placement["id"] if placement else None)
+    url = build_preview_url(template["id"], overlay_text)
     # photo_width/photo_height обязательны — без них tdesktop часто вообще не
     # дёргает photo_url (bug telegramdesktop/tdesktop#4580). Точных размеров
     # не знаем, ставим разумные дефолты.
@@ -183,7 +190,14 @@ async def handle_inline_query(query: InlineQuery):
         offset = int(query.offset) if query.offset else 0
     except ValueError:
         offset = 0
-    PAGE_SIZE = 50
+    # Без текста результат — это готовый cached file_id (мгновенно), поэтому отдаём 50.
+    # С текстом КАЖДЫЙ результат = свежий рендер превью на медиасервере (/preview), и на
+    # холодную ему нужно скачать исходник с TG + вытащить кадр ffmpeg перед дешёвым PIL-
+    # композитом. 50 таких рендеров на КАЖДУЮ букву медиасервер не успевает отдать в узкое
+    # окно Телеграма → часть превью приходит «белыми / через раз». Меньшая первая страница
+    # для текстовых запросов = все превью успевают прогрузиться; остальное подгружается при
+    # скролле (next_offset уже работает).
+    PAGE_SIZE = 12 if overlay_text else 50
 
     if emoji_tags:
         templates = await get_templates_by_tags(pool, emoji_tags, limit=PAGE_SIZE, user_id=user_id, offset=offset)
@@ -215,7 +229,10 @@ async def handle_inline_query(query: InlineQuery):
         else:
             results.append(_build_plain_result(tpl, placement, next_label))
 
-    cache_time = 10
+    # While typing overlay text, force fresh results (cache_time=0) so the preview never
+    # lags a keystroke behind — e.g. adding/removing "?" updates immediately instead of
+    # Telegram serving the previous cached render.
+    cache_time = 0 if overlay_text else 10
     # Full page → there may be more; hand Telegram an offset to fetch the next page.
     next_offset = str(offset + len(templates)) if len(templates) == PAGE_SIZE else ""
     logger.info("inline uid=%d query=%r tpls=%d with_text=%s offset=%d next=%r",
@@ -262,34 +279,30 @@ async def handle_chosen_inline(result: ChosenInlineResult, bot: Bot):
         gif_id=str(template_id) if template_id is not None else raw,
     )
 
-    # Swap the static preview for the live animated gif with text.
+    # Подмена статичного превью на живую гифку. В выдаче мы показываем дешёвые JPEG
+    # (иначе Телеграм роняет почти все результаты, см. _build_preview_result). Когда юзер
+    # ВЫБРАЛ результат — это уже одна гифка, её и рендерим: правим inline-сообщение на
+    # анимацию. Текст берём из result.query (в result_id лежит только хэш).
+    if template_id is None or not result.inline_message_id:
+        return
     _, overlay_text = parse_inline_query(result.query or "")
-    if not (overlay_text and result.inline_message_id and template_id is not None):
+    if not overlay_text:
+        # Без текста результат и так был анимацией (cached file_id) — подменять нечего.
         return
-
-    template = await get_template(pool, template_id)
-    if not template or template["file_type"] != "animation":
-        return
-
-    text_hash = hashlib.md5(overlay_text.encode()).hexdigest()[:12]
-    file_id = await get_cached_gif(pool, str(template_id), text_hash)
-    if not file_id and settings.media_server_url:
-        _, file_id = await _upload_one(bot, pool, template, overlay_text, text_hash)
-    if not file_id:
-        return
-
-    placement = await get_placement(pool, placement_id) if placement_id else None
-    caption = placement["caption_text"] if placement and placement.get("caption_text") else None
-    # Keep the SAME (edited/localized) button label as the static preview. Without this
-    # the swap rebuilds the keyboard with the hardcoded default and the button visibly
-    # reverts to "🔁 Ещё мем" right after the gif finishes loading.
-    lang = await user_lang(result.from_user.id)
-    next_label = await t("inline.next_meme", lang)
     try:
+        template = await get_template(pool, template_id)
+        if not template or template.get("file_type") != "animation":
+            return
+        placement = await get_placement(pool, placement_id) if placement_id else None
+        caption = placement["caption_text"] if placement and placement.get("caption_text") else None
+        lang = await user_lang(result.from_user.id)
+        next_label = await t("inline.next_meme", lang)
         await bot.edit_message_media(
+            media=InputMediaAnimation(
+                media=build_media_url(template_id, overlay_text, "mp4"), caption=caption,
+            ),
             inline_message_id=result.inline_message_id,
-            media=InputMediaAnimation(media=file_id, caption=caption),
             reply_markup=_result_markup(placement, next_label),
         )
-    except TelegramBadRequest as e:
-        logger.warning("inline media swap failed tpl=%s: %s", template_id, e)
+    except Exception as e:
+        logger.warning("inline animation swap failed tid=%s: %s", template_id, e)

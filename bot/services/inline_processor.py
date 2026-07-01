@@ -10,7 +10,7 @@ from bot.config import settings
 # Cache-buster для URL превью. Бампать при любых правках в render_static_preview /
 # media_server, чтобы Telegram-клиенты перекачали (старый URL остаётся в их
 # локальном кэше до суток). При новом значении — старые битые превью игнорятся.
-PREVIEW_URL_VERSION = "6"
+PREVIEW_URL_VERSION = "7"
 
 
 def _sign(template_id: int, text: str) -> str:

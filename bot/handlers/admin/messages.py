@@ -431,12 +431,15 @@ async def step_text(message: Message, state: FSMContext):
         f"✅ Текст: <b>{text}</b>\n\n"
         "🔗 <b>Шаг 3/4 — Callback или ссылка</b>\n\n"
         "Напиши callback_data или URL:\n\n"
-        "<code>meme:start</code> — галерея мемов\n"
+        "<code>menu:open</code> — главное меню\n"
+        "<code>meme:start</code> — создать мем\n"
         "<code>template:add_user</code> — добавить шаблон\n"
         "<code>utpl:quick</code> — личный шаблон (быстро)\n"
         "<code>utpl:public</code> — публичный шаблон\n"
-        "<code>settings:open</code> — настройки\n"
-        "<code>premium:open</code> — Гифыч Premium\n"
+        "<code>settings:open</code> — настройки · <code>settings:language</code> — язык\n"
+        "<code>premium:open</code> — Премиум · <code>premium:gift</code> — подарить\n"
+        "<code>premium:buy:1m:9</code> / <code>6m:15</code> / <code>12m:27</code> / <code>999y:49</code> — покупка\n"
+        "<code>op:check</code> — проверить ОП\n"
         "<code>https://t.me/...</code> — ссылка",
         chat_id=data["pm_cid"],
         message_id=data["pm_mid"],

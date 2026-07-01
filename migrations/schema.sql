@@ -114,6 +114,10 @@ ALTER TABLE templates ADD COLUMN IF NOT EXISTS submitted_by BIGINT;
 ALTER TABLE templates ADD COLUMN IF NOT EXISTS is_public BOOLEAN DEFAULT TRUE;
 ALTER TABLE templates ADD COLUMN IF NOT EXISTS moderation_status VARCHAR(20) DEFAULT 'approved';
 ALTER TABLE templates ADD COLUMN IF NOT EXISTS moderation_comment TEXT;
+-- sha256 сырых байт файла — для отлова дублей публичных шаблонов от РАЗНЫХ юзеров
+-- (при перезаливке одной и той же гифки Telegram выдаёт новый file_unique_id).
+ALTER TABLE templates ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64);
+CREATE INDEX IF NOT EXISTS idx_templates_content_hash ON templates(content_hash) WHERE is_public = TRUE;
 
 -- (welcome / main_menu seed moved below — the i18n migration recomposes the PK so
 --  ON CONFLICT must reference (key, lang). See bottom of file.)
@@ -228,6 +232,8 @@ VALUES ('en', 'English', '🇬🇧', 1)
 ON CONFLICT (code) DO NOTHING;
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS lang VARCHAR(5) DEFAULT 'ru';
+-- Премиум-подписка бота (отключение рекламы/показов). NULL = нет премиума.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS premium_until TIMESTAMPTZ;
 
 -- bot_messages and bot_buttons: add lang column, repkey by (key, lang)
 ALTER TABLE bot_messages ADD COLUMN IF NOT EXISTS lang VARCHAR(5) DEFAULT 'ru';

@@ -62,7 +62,8 @@ async def main():
         await seed_i18n_defaults()
     except Exception as e:
         logger.warning("seed_i18n_defaults failed: %s", e)
-    logger.info("Bot started, pre-warming template cache...")
+    from bot.version import BOT_VERSION
+    logger.info("Bot started (version %s), pre-warming template cache...", BOT_VERSION)
     asyncio.create_task(prewarm_templates(bot))
 
     try:

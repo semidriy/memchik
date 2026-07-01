@@ -9,17 +9,26 @@ class Settings(BaseSettings):
     bot_token: str
     admin_ids: list[int]
     database_url: str
-    cache_chat_id: int  # primary cache chat (for meme.py)
-    cache_chat_ids: list[int] = []
-    moderation_channel_id: int | None = None   # публичные шаблоны — модерация
-    personal_channel_id: int | None = None     # личные (быстрые) шаблоны — только удалить
-    public_channel_id: int | None = None
+    # Единственный технический кэш-канал: media_server/meme.py заливают сюда каждую
+    # уникальную пару (шаблон, текст) ОДИН раз, чтобы получить вечный file_id (см.
+    # gif_cache). Поэтому «каждый закидывается» — это by design, а не баг.
+    cache_chat_id: int
+    # Остальные каналы — это НЕ кэш, а пайплайн шаблонов:
+    moderation_channel_id: int | None = None   # публичные шаблоны — очередь модерации
+    personal_channel_id: int | None = None     # личные (быстрые) шаблоны — лог с удалением
+    public_channel_id: int | None = None       # витрина одобренных шаблонов
+
+    # Прем-эмодзи на кнопках (icon_custom_emoji_id) работают ТОЛЬКО если у аккаунта
+    # бота есть Telegram Premium / имя с Fragment. Без этого Telegram рисует такие
+    # кнопки БЛЁКЛО. Поэтому по умолчанию иконки не шлём (кнопки нормальные); включи
+    # BOT_HAS_PREMIUM=1 в .env, когда у бота будет премка.
+    bot_has_premium: bool = False
 
     # Media server
     media_server_url: str = ""        # e.g. https://tgp.tgis.vu
     media_server_secret: str = ""     # HMAC secret shared between bot and media server
 
-    @field_validator("admin_ids", "cache_chat_ids", mode="before")
+    @field_validator("admin_ids", mode="before")
     @classmethod
     def parse_int_list(cls, v):
         if v is None or v == "":
@@ -43,13 +52,12 @@ class Settings(BaseSettings):
             return int(v.split(",")[0].strip())
         return v
 
-    @property
-    def all_cache_chat_ids(self) -> list[int]:
-        return self.cache_chat_ids or [self.cache_chat_id]
-
     class Config:
         env_file = str(ENV_FILE)
         env_file_encoding = "utf-8"
+        # Лишние/старые переменные в .env (напр. CACHE_CHAT_IDS) НЕ должны ронять
+        # бота на старте — просто игнорируем неизвестные ключи.
+        extra = "ignore"
 
 
 settings = Settings()

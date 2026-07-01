@@ -18,6 +18,7 @@ from bot.database.queries import (
 )
 from bot.keyboards.admin import templates_menu, templates_list, template_item
 from bot.services.query_parser import extract_emojis
+from bot.services.media_intake import video_to_animation
 from bot.states.admin import TemplateStates
 
 router = Router()
@@ -69,6 +70,16 @@ async def handle_template_media(message: Message, state: FSMContext):
         file_id, file_unique_id, file_type = (
             message.photo[-1].file_id, message.photo[-1].file_unique_id, "photo"
         )
+    elif message.video:
+        # Видео из галереи (часто со звуком) → перезаливаем как animation, см. helper.
+        try:
+            file_id, file_unique_id = await video_to_animation(message.bot, message.video.file_id)
+            file_type = "animation"
+        except Exception as e:
+            logger.warning("video->animation failed: %s", e)
+            file_id, file_unique_id, file_type = (
+                message.video.file_id, message.video.file_unique_id, "animation"
+            )
     elif message.document and message.document.mime_type and (
         message.document.mime_type.startswith("image/gif")
         or message.document.mime_type.startswith("video/")

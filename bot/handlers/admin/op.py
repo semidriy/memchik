@@ -20,23 +20,16 @@ router = Router()
 
 _TYPE_LABEL = {"channel": "📢 Канал", "bot": "🤖 Бот", "link": "🔗 Без проверки", "folder": "📁 Папка"}
 
-_ADD_TEXT = (
-    "Введите данные в формате:\n\n"
-    "<code>Токен бота | ID канала</code>\n"
-    "<code>Название кнопки</code>\n"
-    "<code>Ссылка на бота / канал</code>\n"
-    "<code>Отслеживать подписки (1 - да, 0 - нет)</code>\n"
-    "<code>Лимит переходов (0 - без лимита)</code>\n\n"
-    "Примеры:\n"
-    "Если канал с проверкой подписки:\n"
-    "<code> | -1001234567890\nМой канал\nhttps://t.me/mychannel\n1\n0</code>\n\n"
-    "Если бот с токеном:\n"
-    "<code>123456:TOKEN | @mybot\nМой бот\nhttps://t.me/mybot\n1\n100</code>\n\n"
-    "Если ссылка без проверки:\n"
-    "<code> | https://t.me/+invitecode\nЗакрытый канал\nhttps://t.me/+invitecode\n0\n0</code>"
-)
-
 _CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="❌ Отмена", callback_data="op:cancel_add")],
+])
+
+# Шаг 3 мастера: тип проверки (как в «кружочке»).
+_CHECK_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="✅ Проверка подписки", callback_data="op:ctype:sub")],
+    [InlineKeyboardButton(text="⌛ Проверка заявки (закрытый)", callback_data="op:ctype:req")],
+    [InlineKeyboardButton(text="🤖 Проверка запуска бота", callback_data="op:ctype:bot")],
+    [InlineKeyboardButton(text="🚫 Без проверки (просто показать)", callback_data="op:ctype:none")],
     [InlineKeyboardButton(text="❌ Отмена", callback_data="op:cancel_add")],
 ])
 
@@ -48,185 +41,28 @@ async def is_admin(user_id: int) -> bool:
     return await has_permission(user_id, PERM_OP)
 
 
-@router.callback_query(F.data == "op:list")
-async def cb_op_list(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.id):
-        return
-    pool = get_pool()
-    channels = await get_all_op_channels(pool)
-    if not channels:
-        await callback.message.edit_text("Каналов ещё нет", reply_markup=op_menu())
-        await callback.answer()
-        return
-    await callback.message.edit_text("Каналы ОП:", reply_markup=op_list(channels))
-    await callback.answer()
-
-
-@router.callback_query(F.data == "op:add")
-async def cb_op_add(callback: CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
-        return
-    await state.set_state(OpStates.waiting_input)
-    await state.update_data(pm_cid=callback.message.chat.id, pm_mid=callback.message.message_id)
-    await callback.message.edit_text(_ADD_TEXT, parse_mode="HTML", reply_markup=_CANCEL_KB)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "op:cancel_add")
-async def cb_op_cancel_add(callback: CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
-        return
-    await state.clear()
-    await callback.message.edit_text("⭐️ ОП каналы", reply_markup=op_menu())
-    await callback.answer()
-
-
-def _normalize(text: str) -> str:
-    text = text.strip()
-    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
-        if text.lower().startswith(prefix):
-            return "@" + text[len(prefix):]
-    if not text.startswith("@"):
-        return "@" + text
-    return text
-
-
-@router.message(OpStates.waiting_input)
-async def handle_op_input(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        return
-
-    data = await state.get_data()
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    async def _err(text: str):
-        await message.bot.edit_message_text(
-            _ADD_TEXT + f"\n\n❌ {text}",
-            chat_id=data["pm_cid"], message_id=data["pm_mid"],
-            parse_mode="HTML", reply_markup=_CANCEL_KB,
-        )
-
-    lines = [l.strip() for l in (message.text or "").strip().split("\n")]
-    if len(lines) < 5:
-        await _err("Нужно 5 строк. Попробуй ещё раз.")
-        return
-
-    # Line 1: [token |] channel_id_or_username
-    raw1 = lines[0]
-    if "|" in raw1:
-        token_raw, ch_raw = raw1.split("|", 1)
-        token = token_raw.strip() or None
-        ch_raw = ch_raw.strip()
-    else:
-        token = None
-        ch_raw = raw1.strip()
-
-    title = lines[1].strip()
-    if not title:
-        await _err("Название кнопки (строка 2) не может быть пустым.")
-        return
-
-    invite_link = lines[2].strip()
-
-    check_sub = lines[3].strip()
-    if check_sub not in ("0", "1"):
-        await _err("Строка 4 должна быть 1 (проверять) или 0 (не проверять).")
-        return
-
-    try:
-        limit_visits = int(lines[4].strip())
-    except ValueError:
-        await _err("Строка 5 должна быть числом (0 = без лимита).")
-        return
-
-    # Determine channel type and ID
-    pool = get_pool()
-
-    # Private link or folder
-    ch_clean = ch_raw.replace("https://", "").replace("http://", "")
-    if ch_clean.startswith("t.me/addlist/") or ch_raw.lower().startswith("tg://addlist"):
-        await add_op_channel(pool, None, "", title, invite_link or ch_raw,
-                             "folder", limit_visits=limit_visits)
-        await state.clear()
-        await message.bot.edit_message_text(
-            f"✅ 📁 Папка <b>{title}</b> добавлена\n⚠️ Подписка не проверяется",
-            chat_id=data["pm_cid"], message_id=data["pm_mid"],
-            parse_mode="HTML", reply_markup=op_menu(),
-        )
-        return
-
-    if ch_clean.startswith("t.me/+"):
-        lnk = "https://" + ch_clean
-        await add_op_channel(pool, None, "", title, invite_link or lnk,
-                             "link", limit_visits=limit_visits)
-        await state.clear()
-        await message.bot.edit_message_text(
-            f"✅ 🔗 <b>{title}</b> добавлен\n⚠️ Подписка не проверяется",
-            chat_id=data["pm_cid"], message_id=data["pm_mid"],
-            parse_mode="HTML", reply_markup=op_menu(),
-        )
-        return
-
-    # Numeric channel ID
-    ch_stripped = ch_raw.lstrip("@").strip()
-    if ch_stripped.lstrip("-").isdigit():
-        channel_id = int(ch_stripped)
-        username = ""
-        channel_type = "bot" if token else ("channel" if check_sub == "1" else "link")
-        if token:
-            valid = await _validate_token(token)
-            if not valid:
-                await _err("Токен бота невалиден. Проверь и попробуй снова.")
-                return
-        await add_op_channel(pool, channel_id, username, title, invite_link,
-                             channel_type, bot_token=token, limit_visits=limit_visits)
-        await state.clear()
-        label = _TYPE_LABEL.get(channel_type, "Добавлено")
-        await message.bot.edit_message_text(
-            f"✅ {label} <b>{title}</b> добавлен (ID: <code>{channel_id}</code>)",
-            chat_id=data["pm_cid"], message_id=data["pm_mid"],
-            parse_mode="HTML", reply_markup=op_menu(),
-        )
-        return
-
-    # @username — resolve via Telegram
-    username_norm = _normalize(ch_raw)
-    try:
-        chat = await message.bot.get_chat(username_norm)
-    except TelegramBadRequest:
-        await _err(f"Канал/бот {username_norm} не найден.")
-        return
-
-    channel_id = chat.id
-    uname = chat.username or ""
-    channel_type = "bot" if token else ("channel" if check_sub == "1" else "link")
-
-    if token:
-        valid = await _validate_token(token)
-        if not valid:
-            await _err("Токен бота невалиден. Проверь и попробуй снова.")
-            return
-
-    final_link = invite_link or (f"https://t.me/{uname}" if uname else "")
-    if not final_link and channel_type == "channel":
-        try:
-            lnk = await message.bot.create_chat_invite_link(channel_id)
-            final_link = lnk.invite_link
-        except Exception:
-            pass
-
-    await add_op_channel(pool, channel_id, uname, title, final_link,
-                         channel_type, bot_token=token, limit_visits=limit_visits)
-    await state.clear()
-    label = _TYPE_LABEL.get(channel_type, "Добавлено")
+async def _panel(message: Message, data: dict, text: str, kb: InlineKeyboardMarkup = _CANCEL_KB):
+    """Перерисовываем сообщение-панель мастера (его id лежит в state), а не плодим новые."""
     await message.bot.edit_message_text(
-        f"✅ {label} <b>{title}</b> добавлен",
-        chat_id=data["pm_cid"], message_id=data["pm_mid"],
-        parse_mode="HTML", reply_markup=op_menu(),
+        text, chat_id=data["pm_cid"], message_id=data["pm_mid"],
+        parse_mode="HTML", reply_markup=kb,
     )
+
+
+def _public_username(url: str) -> str | None:
+    """Из ссылки достаём публичный @username (для авто-определения ID канала).
+    Для приватных инвайтов (t.me/+…, joinchat, addlist) возвращаем None."""
+    u = (url or "").strip()
+    low = u.lower()
+    if "t.me/+" in low or "joinchat" in low or "addlist" in low or "tg://" in low:
+        return None
+    for p in ("https://t.me/", "http://t.me/", "t.me/"):
+        if low.startswith(p):
+            handle = u[len(p):].split("/")[0].split("?")[0]
+            return handle or None
+    if u.startswith("@"):
+        return u[1:]
+    return None
 
 
 async def _validate_token(token: str) -> bool:
@@ -242,6 +78,22 @@ async def _validate_token(token: str) -> bool:
         return False
 
 
+# ===== Список / просмотр =====
+
+@router.callback_query(F.data == "op:list")
+async def cb_op_list(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+    pool = get_pool()
+    channels = await get_all_op_channels(pool)
+    if not channels:
+        await callback.message.edit_text("Ресурсов ОП ещё нет", reply_markup=op_menu())
+        await callback.answer()
+        return
+    await callback.message.edit_text("📋 Ресурсы ОП:", reply_markup=op_list(channels))
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("op:view:"))
 async def cb_op_view(callback: CallbackQuery):
     if not await is_admin(callback.from_user.id):
@@ -255,13 +107,14 @@ async def cb_op_view(callback: CallbackQuery):
     ch = dict(row)
     status = "🟢 Активен" if ch["is_active"] else "🔴 Отключён"
     ch_type = _TYPE_LABEL.get(ch.get("channel_type", "channel"), "📢 Канал")
-    verify = "" if ch.get("channel_type", "channel") == "channel" else "\n⚠️ Подписка не проверяется"
+    verify = "" if ch.get("channel_type", "channel") in ("channel", "bot") else "\n⚠️ Подписка не проверяется"
     limit = ch.get("limit_visits") or 0
-    limit_str = f"\nЛимит: {limit}" if limit else ""
+    limit_str = f"\nЛимит переходов: {limit}" if limit else ""
     await callback.message.edit_text(
         f"{ch_type}: <b>{ch['title']}</b>\n"
         f"ID: <code>{ch['channel_id'] or '—'}</code>\n"
         f"Username: {('@' + ch['channel_username']) if ch.get('channel_username') else '—'}\n"
+        f"Ссылка: {ch.get('invite_link') or '—'}\n"
         f"Статус: {status}{verify}{limit_str}",
         parse_mode="HTML",
         reply_markup=op_channel_item(ch_db_id, ch["title"], ch["is_active"]),
@@ -271,6 +124,193 @@ async def cb_op_view(callback: CallbackQuery):
     except TelegramBadRequest:
         pass
 
+
+# ===== Мастер добавления (как в KruzhokBot) =====
+
+@router.callback_query(F.data == "op:add")
+async def cb_op_add(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    await state.set_state(OpStates.add_title)
+    await state.update_data(pm_cid=callback.message.chat.id, pm_mid=callback.message.message_id)
+    await callback.message.edit_text(
+        "➕ <b>Добавление ресурса ОП</b>\n\n"
+        "Шаг 1/4 — пришли <b>название кнопки</b> (что увидит пользователь):",
+        parse_mode="HTML", reply_markup=_CANCEL_KB,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "op:cancel_add")
+async def cb_op_cancel_add(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    await state.clear()
+    await callback.message.edit_text("⭐️ ОП ресурсы", reply_markup=op_menu())
+    await callback.answer()
+
+
+@router.message(OpStates.add_title)
+async def w_title(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    title = (message.text or "").strip()
+    data = await state.get_data()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if not title:
+        await _panel(message, data, "Шаг 1/4 — название пустое. Пришли текст кнопки:")
+        return
+    await state.update_data(title=title)
+    await state.set_state(OpStates.add_url)
+    await _panel(
+        message, data,
+        f"✅ Название: <b>{title}</b>\n\n"
+        "Шаг 2/4 — пришли <b>ссылку</b>:\n"
+        "• открытый канал: <code>@username</code> или <code>https://t.me/username</code>\n"
+        "• закрытый канал: инвайт-ссылка <code>https://t.me/+…</code>\n"
+        "• бот: <code>https://t.me/yourbot</code>",
+    )
+
+
+@router.message(OpStates.add_url)
+async def w_url(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    url = (message.text or "").strip()
+    data = await state.get_data()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if not url:
+        await _panel(message, data, "Шаг 2/4 — ссылка пустая. Пришли ссылку:")
+        return
+    await state.update_data(url=url)
+    await _panel(
+        message, data,
+        f"✅ Ссылка: {url}\n\nШаг 3/4 — выбери <b>тип проверки</b>:",
+        kb=_CHECK_KB,
+    )
+
+
+@router.callback_query(F.data.startswith("op:ctype:"))
+async def w_ctype(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    kind = callback.data.split(":")[2]  # sub | req | bot | none
+    data = await state.get_data()
+    if not data.get("title") or not data.get("url"):
+        await state.clear()
+        await callback.message.edit_text("Сессия сброшена, начни заново.", reply_markup=op_menu())
+        await callback.answer()
+        return
+    pool = get_pool()
+    title, url = data["title"], data["url"]
+
+    if kind == "none":
+        await add_op_channel(pool, None, "", title, url, "link")
+        await state.clear()
+        await callback.message.edit_text(
+            f"✅ 🔗 <b>{title}</b> добавлен (без проверки)",
+            parse_mode="HTML", reply_markup=op_menu(),
+        )
+        await callback.answer()
+        return
+
+    if kind == "bot":
+        await state.set_state(OpStates.add_token)
+        await callback.message.edit_text(
+            "🤖 Шаг 4/4 — пришли <b>токен бота</b> (из @BotFather).\n"
+            "Проверка засчитается, когда пользователь запустит этого бота.",
+            parse_mode="HTML", reply_markup=_CANCEL_KB,
+        )
+        await callback.answer()
+        return
+
+    # sub / req → канал с проверкой. Открытый канал ID определим сами.
+    username = _public_username(url)
+    channel_id, uname = None, ""
+    if username:
+        try:
+            chat = await callback.bot.get_chat("@" + username)
+            channel_id, uname = chat.id, (chat.username or username)
+        except Exception:
+            channel_id = None
+
+    if channel_id:
+        await add_op_channel(pool, channel_id, uname, title, url, "channel")
+        await state.clear()
+        await callback.message.edit_text(
+            f"✅ 📢 <b>{title}</b> добавлен\nID <code>{channel_id}</code> · проверка включена",
+            parse_mode="HTML", reply_markup=op_menu(),
+        )
+        await callback.answer()
+        return
+
+    # Закрытый канал — ID сам не достанется, просим ввести.
+    await state.set_state(OpStates.add_chatid)
+    await callback.message.edit_text(
+        "🔒 <b>Закрытый канал</b> — чтобы проверять заявку (как в «кружочке»):\n"
+        "1) добавь бота <b>администратором</b> в канал;\n"
+        "2) включи в канале режим <b>«Заявки на вступление»</b>;\n"
+        "3) перешли любой пост из канала боту @userinfobot — он покажет ID (вида <code>-100…</code>).\n\n"
+        "Шаг 4/4 — пришли этот <b>ID канала</b>:",
+        parse_mode="HTML", reply_markup=_CANCEL_KB,
+    )
+    await callback.answer()
+
+
+@router.message(OpStates.add_chatid)
+async def w_chatid(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    data = await state.get_data()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if not raw.lstrip("-").isdigit():
+        await _panel(message, data, "ID должен быть числом (вида <code>-1001234567890</code>). Пришли ещё раз:")
+        return
+    channel_id = int(raw)
+    pool = get_pool()
+    await add_op_channel(pool, channel_id, "", data["title"], data["url"], "channel")
+    await state.clear()
+    await message.bot.edit_message_text(
+        f"✅ 🔒 <b>{data['title']}</b> добавлен\nID <code>{channel_id}</code> · проверка по заявке включена",
+        chat_id=data["pm_cid"], message_id=data["pm_mid"],
+        parse_mode="HTML", reply_markup=op_menu(),
+    )
+
+
+@router.message(OpStates.add_token)
+async def w_token(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    token = (message.text or "").strip()
+    data = await state.get_data()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if not await _validate_token(token):
+        await _panel(message, data, "Токен невалиден. Проверь и пришли ещё раз:")
+        return
+    pool = get_pool()
+    await add_op_channel(pool, None, "", data["title"], data["url"], "bot", bot_token=token)
+    await state.clear()
+    await message.bot.edit_message_text(
+        f"✅ 🤖 <b>{data['title']}</b> добавлен (проверка запуска бота)",
+        chat_id=data["pm_cid"], message_id=data["pm_mid"],
+        parse_mode="HTML", reply_markup=op_menu(),
+    )
+
+
+# ===== Управление ресурсом =====
 
 @router.callback_query(F.data.startswith("op:toggle:"))
 async def cb_op_toggle(callback: CallbackQuery):
@@ -345,13 +385,14 @@ async def handle_op_rename(message: Message, state: FSMContext):
     ch = dict(row)
     status = "🟢 Активен" if ch["is_active"] else "🔴 Отключён"
     ch_type = _TYPE_LABEL.get(ch.get("channel_type", "channel"), "📢 Канал")
-    verify = "" if ch.get("channel_type", "channel") == "channel" else "\n⚠️ Подписка не проверяется"
+    verify = "" if ch.get("channel_type", "channel") in ("channel", "bot") else "\n⚠️ Подписка не проверяется"
     limit = ch.get("limit_visits") or 0
-    limit_str = f"\nЛимит: {limit}" if limit else ""
+    limit_str = f"\nЛимит переходов: {limit}" if limit else ""
     await message.bot.edit_message_text(
         f"{ch_type}: <b>{ch['title']}</b>\n"
         f"ID: <code>{ch['channel_id'] or '—'}</code>\n"
         f"Username: {('@' + ch['channel_username']) if ch.get('channel_username') else '—'}\n"
+        f"Ссылка: {ch.get('invite_link') or '—'}\n"
         f"Статус: {status}{verify}{limit_str}",
         chat_id=data["pm_cid"], message_id=data["pm_mid"],
         parse_mode="HTML",

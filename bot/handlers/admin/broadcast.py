@@ -797,14 +797,16 @@ async def _send_to_user(bot: Bot, user_id: int, broadcast: dict):
                 cap_entities = _ents(item.get("caption_entities") or [])
                 t = item["type"]
                 fid = item["file_id"]
+                # parse_mode=None: дефолт бота — HTML, иначе caption_entities игнорируются
+                # (пропадают формат и прем-эмодзи в подписи).
                 if t == "photo":
-                    media.append(InputMediaPhoto(media=fid, caption=cap, caption_entities=cap_entities))
+                    media.append(InputMediaPhoto(media=fid, caption=cap, caption_entities=cap_entities, parse_mode=None))
                 elif t == "video":
-                    media.append(InputMediaVideo(media=fid, caption=cap, caption_entities=cap_entities))
+                    media.append(InputMediaVideo(media=fid, caption=cap, caption_entities=cap_entities, parse_mode=None))
                 elif t == "audio":
-                    media.append(InputMediaAudio(media=fid, caption=cap, caption_entities=cap_entities))
+                    media.append(InputMediaAudio(media=fid, caption=cap, caption_entities=cap_entities, parse_mode=None))
                 elif t == "document":
-                    media.append(InputMediaDocument(media=fid, caption=cap, caption_entities=cap_entities))
+                    media.append(InputMediaDocument(media=fid, caption=cap, caption_entities=cap_entities, parse_mode=None))
             if media:
                 await bot.send_media_group(user_id, media)
             return
@@ -817,22 +819,24 @@ async def _send_to_user(bot: Bot, user_id: int, broadcast: dict):
         text = item.get("text", "")
         txt_entities = _ents(item.get("entities") or [])
 
+        # parse_mode=None везде, где передаём entities/caption_entities: дефолт бота —
+        # HTML, и без сброса Телеграм игнорирует энтити (формат и прем-эмодзи теряются).
         if item_type == "text":
-            await bot.send_message(user_id, text, entities=txt_entities, reply_markup=markup)
+            await bot.send_message(user_id, text, entities=txt_entities, parse_mode=None, reply_markup=markup)
         elif item_type == "photo":
-            await bot.send_photo(user_id, file_id, caption=caption, caption_entities=cap_entities, reply_markup=markup)
+            await bot.send_photo(user_id, file_id, caption=caption, caption_entities=cap_entities, parse_mode=None, reply_markup=markup)
         elif item_type == "video":
-            await bot.send_video(user_id, file_id, caption=caption, caption_entities=cap_entities, reply_markup=markup)
+            await bot.send_video(user_id, file_id, caption=caption, caption_entities=cap_entities, parse_mode=None, reply_markup=markup)
         elif item_type == "animation":
-            await bot.send_animation(user_id, file_id, caption=caption, caption_entities=cap_entities, reply_markup=markup)
+            await bot.send_animation(user_id, file_id, caption=caption, caption_entities=cap_entities, parse_mode=None, reply_markup=markup)
         elif item_type == "audio":
-            await bot.send_audio(user_id, file_id, caption=caption, caption_entities=cap_entities, reply_markup=markup)
+            await bot.send_audio(user_id, file_id, caption=caption, caption_entities=cap_entities, parse_mode=None, reply_markup=markup)
         elif item_type == "voice":
-            await bot.send_voice(user_id, file_id, caption=caption, caption_entities=cap_entities, reply_markup=markup)
+            await bot.send_voice(user_id, file_id, caption=caption, caption_entities=cap_entities, parse_mode=None, reply_markup=markup)
         elif item_type == "video_note":
             await bot.send_video_note(user_id, file_id, reply_markup=markup)
         elif item_type == "document":
-            await bot.send_document(user_id, file_id, caption=caption, caption_entities=cap_entities, reply_markup=markup)
+            await bot.send_document(user_id, file_id, caption=caption, caption_entities=cap_entities, parse_mode=None, reply_markup=markup)
         elif item_type == "sticker":
             await bot.send_sticker(user_id, file_id, reply_markup=markup)
         return

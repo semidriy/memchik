@@ -13,8 +13,13 @@ class LinkStates(StatesGroup):
 
 
 class OpStates(StatesGroup):
-    waiting_input = State()    # 5-line add format
+    waiting_input = State()    # legacy 5-line add format (не используется, оставлен на всякий)
     waiting_rename = State()
+    # Пошаговый мастер добавления ресурса ОП (как в KruzhokBot)
+    add_title = State()        # шаг 1: название кнопки
+    add_url = State()          # шаг 2: ссылка (канал / инвайт закрытого / бот)
+    add_chatid = State()       # шаг 4: ID закрытого канала (через @userinfobot)
+    add_token = State()        # шаг 4: токен бота (для типа «бот»)
 
 
 class TemplateStates(StatesGroup):

@@ -7,15 +7,18 @@ Translation keys come from two sources:
 Buttons in bot_buttons are *not* translated here. They are admin-curated via the Buttons
 section; if you need a localized button row, add it via Buttons with the target language set.
 """
+import logging
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
+
+logger = logging.getLogger(__name__)
 
 from bot.database import get_pool
 from bot.database.queries import (
     get_languages, get_language, add_language, update_language, delete_language,
     get_i18n_string, set_i18n_string,
-    get_bot_message, set_bot_message,
+    get_bot_message, set_bot_message, set_bot_message_media,
     get_all_bot_buttons, get_bot_buttons, set_bot_buttons,
 )
 from bot.keyboards.admin import (
@@ -31,7 +34,7 @@ router = Router()
 # Keys that belong to bot_messages (long texts), not i18n_strings.
 # settings/premium включены, чтобы тексты этих менюшек (с прем-эмодзи) тоже
 # редактировались по каждому языку, а не только главное меню.
-_BOT_MESSAGE_KEYS = ["welcome", "op_required", "op_passed", "meme_send_text", "settings", "premium"]
+_BOT_MESSAGE_KEYS = ["welcome", "op_required", "op_passed", "meme_send_text", "settings", "premium", "tpl.add_choose_type"]
 _PAGE_SIZE = 10
 
 
@@ -221,6 +224,7 @@ def _key_hint(k: str) -> str:
             "meme_send_text": "Текст «введи текст для мема»",
             "settings": "Заголовок меню настроек",
             "premium": "Текст меню Premium",
+            "tpl.add_choose_type": "Экран «как добавить шаблон»",
         }
         return labels.get(k, "")
     short = val.replace("\n", " ").replace("<b>", "").replace("</b>", "")
@@ -298,21 +302,16 @@ async def cb_lang_edit_key(callback: CallbackQuery, state: FSMContext):
         key = parts[3] if len(parts) > 3 else ""
     pool = get_pool()
     cur, ru = await _get_current_translation(pool, code, key)
+    _, media_type = await _lang_media(pool, code, key)
     await state.set_state(LanguageStates.waiting_translation)
     await state.update_data(
         pm_cid=callback.message.chat.id, pm_mid=callback.message.message_id,
         code=code, key=key, page=page,
     )
-    cur_preview = cur if cur else "<i>не задано → используется RU</i>"
     await callback.message.edit_text(
-        f"✏️ <b>{key}</b>  [{code}]\n\n"
-        f"<b>RU:</b>\n<code>{_esc(ru)}</code>\n\n"
-        f"<b>Текущий:</b>\n{_esc(cur_preview) if cur else cur_preview}\n\n"
-        "Отправь новый текст. Чтобы вернуться к RU-фолбэку — отправь <code>-</code>.",
+        _tr_screen_text(key, code, ru, cur, media_type),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ К списку ключей", callback_data=f"lang:tr:{code}:{page}")],
-        ]),
+        reply_markup=_tr_edit_kb(code, page, key, bool(media_type)),
     )
     await callback.answer()
 
@@ -321,54 +320,138 @@ def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _tr_edit_kb(code: str, page: int, key: str, has_media: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if has_media:
+        rows.append([InlineKeyboardButton(text="🗑 Убрать медиа", callback_data=f"lang:media_clear:{code}:{page}:{key}")])
+    rows.append([InlineKeyboardButton(text="◀️ К списку ключей", callback_data=f"lang:tr:{code}:{page}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _lang_media(pool, code: str, key: str) -> tuple[str | None, str | None]:
+    """Медиа, заданное ИМЕННО для этого языка (без RU-наследования)."""
+    if key not in _BOT_MESSAGE_KEYS:
+        return None, None
+    row = await pool.fetchrow(
+        "SELECT file_id, file_type FROM bot_messages WHERE key = $1 AND lang = $2", key, code,
+    )
+    return (row["file_id"], row["file_type"]) if row else (None, None)
+
+
+def _extract_media(message: Message) -> tuple[str | None, str | None]:
+    if message.animation:
+        return message.animation.file_id, "animation"
+    if message.video:
+        return message.video.file_id, "video"
+    if message.photo:
+        return message.photo[-1].file_id, "photo"
+    return None, None
+
+
+def _tr_screen_text(key: str, code: str, ru: str, cur: str, media_type: str | None) -> str:
+    cur_preview = cur if cur else "<i>не задано → используется RU</i>"
+    media_line = f"\n🎬 Медиа: <b>{media_type}</b> прикреплено" if media_type else ""
+    hint = ""
+    if key in _BOT_MESSAGE_KEYS:
+        hint = "\n🎬 Можно прислать <b>видео / гиф / фото</b> — прикрепится к менюшке (подпись станет текстом)."
+    return (
+        f"✏️ <b>{key}</b>  [{code}]{media_line}\n\n"
+        f"<b>RU:</b>\n<code>{_esc(ru)}</code>\n\n"
+        f"<b>Текущий:</b>\n{_esc(cur_preview) if cur else cur_preview}\n\n"
+        "Отправь новый текст. Чтобы вернуться к RU-фолбэку — отправь <code>-</code>."
+        + hint
+    )
+
+
 @router.message(LanguageStates.waiting_translation)
 async def handle_translation(message: Message, state: FSMContext):
     if not await has_permission(message.from_user.id, PERM_LANGUAGES):
         return
     data = await state.get_data()
     code, key = data["code"], data["key"]
-    text = (message.text or "").strip()
-    try:
-        await message.delete()
-    except Exception:
-        pass
+    page = data.get("page", 0)
+    # У медиа текст приходит в подписи, у обычного сообщения — в .text.
+    # НЕ .strip() — обрезка ведущих пробелов сдвинула бы offset'ы энтитей (прем-эмодзи,
+    # форматирование) и Телеграм отбросил бы часть из них. Для управляющих проверок
+    # (пусто / «-») используем отдельный stripped-вариант.
+    text = message.text or message.caption or ""
+    text_cmd = text.strip()
+    ents = message.entities or message.caption_entities
+    media_file_id, media_type = _extract_media(message) if key in _BOT_MESSAGE_KEYS else (None, None)
+    # Диагностика: что именно прислал админ — какие энтити (прем-эмодзи/формат) видим.
+    logger.info(
+        "TR-SAVE key=%s lang=%s text_len=%d entities=%s",
+        key, code, len(text),
+        [(e.type, e.offset, e.length, getattr(e, "custom_emoji_id", None)) for e in (ents or [])],
+    )
+    # Сообщение С МЕДИА не удаляем: оно остаётся источником гифки/видео в чате, его не
+    # из чего пересоздать, если стереть. Чисто текстовое — убираем, чтобы не засорять.
+    if not media_file_id:
+        try:
+            await message.delete()
+        except Exception:
+            pass
     pool = get_pool()
-    # `-` clears translation → fallback to RU
-    if text == "-":
+
+    if media_file_id and not text_cmd:
+        # Прислали только медиа — прикрепляем, текст не трогаем.
+        await set_bot_message_media(pool, key, media_file_id, media_type, code)
+    elif text_cmd == "-":
+        # `-` сбрасывает перевод → RU-фолбэк (и текст, и медиа этого языка).
         if key in _BOT_MESSAGE_KEYS:
-            await pool.execute(
-                "DELETE FROM bot_messages WHERE key = $1 AND lang = $2", key, code,
-            )
+            await pool.execute("DELETE FROM bot_messages WHERE key = $1 AND lang = $2", key, code)
         else:
-            await pool.execute(
-                "DELETE FROM i18n_strings WHERE key = $1 AND lang = $2", key, code,
-            )
+            await pool.execute("DELETE FROM i18n_strings WHERE key = $1 AND lang = $2", key, code)
     else:
-        entities_payload = []
-        if message.entities:
-            entities_payload = [e.model_dump(exclude_none=True) for e in message.entities]
+        entities_payload = [e.model_dump(exclude_none=True) for e in ents] if ents else []
         if key in _BOT_MESSAGE_KEYS:
             await set_bot_message(pool, key, text, entities_payload, code)
+            if media_file_id:
+                await set_bot_message_media(pool, key, media_file_id, media_type, code)
         else:
-            await set_i18n_string(pool, key, code, text)
+            # Обычные i18n-строки — без энтитей, можно сохранить очищенный текст.
+            await set_i18n_string(pool, key, code, text_cmd)
 
     cur, ru = await _get_current_translation(pool, code, key)
-    cur_preview = cur if cur else "<i>не задано → используется RU</i>"
+    _, cur_media_type = await _lang_media(pool, code, key)
     try:
         await message.bot.edit_message_text(
-            f"✅ Сохранено.\n\n"
-            f"✏️ <b>{key}</b>  [{code}]\n\n"
-            f"<b>RU:</b>\n<code>{_esc(ru)}</code>\n\n"
-            f"<b>Текущий:</b>\n{_esc(cur_preview) if cur else cur_preview}\n\n"
-            "Отправь новый текст. Чтобы вернуться к RU-фолбэку — отправь <code>-</code>.",
+            "✅ Сохранено.\n\n" + _tr_screen_text(key, code, ru, cur, cur_media_type),
             chat_id=data["pm_cid"], message_id=data["pm_mid"],
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ К списку ключей", callback_data=f"lang:tr:{code}:{data.get('page', 0)}")],
-            ]),
+            reply_markup=_tr_edit_kb(code, page, key, bool(cur_media_type)),
         )
     except Exception:
         pass
+
+
+@router.callback_query(F.data.startswith("lang:media_clear:"))
+async def cb_lang_media_clear(callback: CallbackQuery, state: FSMContext):
+    if not await _check(callback):
+        return
+    # format: lang:media_clear:{code}:{page}:{key}
+    parts = callback.data.split(":", 4)
+    code = parts[2]
+    try:
+        page = int(parts[3])
+        key = parts[4]
+    except (IndexError, ValueError):
+        page = 0
+        key = parts[-1]
+    pool = get_pool()
+    await set_bot_message_media(pool, key, None, None, code)
+    cur, ru = await _get_current_translation(pool, code, key)
+    await state.set_state(LanguageStates.waiting_translation)
+    await state.update_data(
+        pm_cid=callback.message.chat.id, pm_mid=callback.message.message_id,
+        code=code, key=key, page=page,
+    )
+    await callback.message.edit_text(
+        "✅ Медиа убрано.\n\n" + _tr_screen_text(key, code, ru, cur, None),
+        parse_mode="HTML",
+        reply_markup=_tr_edit_kb(code, page, key, False),
+    )
+    await callback.answer("Медиа убрано")
 
 
 # ============ Buttons editor (bot_buttons per lang) ============
@@ -433,12 +516,17 @@ async def cb_lang_btn_edit(callback: CallbackQuery, state: FSMContext):
         "Юникод-фолбэк из текста срежется. "
         "⚠️ Работает только если у владельца бота есть Telegram Premium или бот купил доп. имя на Fragment.\n\n"
         "📋 <b>Доступные колбэки:</b>\n"
-        "<code>meme:start</code> — открыть галерею мемов\n"
-        "<code>template:add_user</code> — добавить свой шаблон\n"
-        "<code>op:check</code> — проверить ОП\n"
-        "<code>settings:open</code> — настройки\n"
-        "<code>premium:open</code> — Гифыч Premium\n"
-        "<code>menu:open</code> — главное меню\n\n"
+        "• <code>menu:open</code> — главное меню\n"
+        "• <code>meme:start</code> — создать мем\n"
+        "• <code>template:add_user</code> — добавить шаблон "
+        "(<code>utpl:quick</code> — личный, <code>utpl:public</code> — публичный)\n"
+        "• <code>settings:open</code> — настройки · <code>settings:language</code> — выбор языка\n"
+        "• <code>premium:open</code> — Гифыч Premium · <code>premium:gift</code> — подарить\n"
+        "• <code>premium:buy:1m:9</code> / <code>premium:buy:6m:15</code> / "
+        "<code>premium:buy:12m:27</code> / <code>premium:buy:999y:49</code> — покупка\n"
+        "• <code>op:check</code> — проверить ОП\n"
+        "• <code>settings:back</code> · <code>premium:back</code> — назад\n"
+        "• ссылка — просто вставь <code>https://…</code> вместо колбэка\n\n"
         "🎨 <b>Цвет</b> (опц.) — третий <code>|</code>: <code>primary</code>/<code>success</code>/<code>danger</code>\n"
         "Разные строки = разные ряды. Кнопки в одном ряду — через <code> || </code>",
         parse_mode="HTML",

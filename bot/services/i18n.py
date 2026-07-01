@@ -16,7 +16,7 @@ from bot.database.queries import (
     get_i18n_string as _db_get_string,
     seed_i18n_defaults as _db_seed,
 )
-from bot.services.i18n_defaults import DEFAULTS
+from bot.services.i18n_defaults import DEFAULTS, DEFAULTS_BY_LANG
 
 _TTL = 60.0
 _lang_cache: dict[int, tuple[str, float]] = {}
@@ -37,10 +37,11 @@ async def user_lang(user_id: int) -> str:
 
 
 async def t(key: str, lang: str = "ru", **kwargs) -> str:
-    """Look up string for given key+lang. Falls back to RU row, then to DEFAULTS dict."""
+    """Look up string for given key+lang. Falls back to a DB row, then to the shipped
+    defaults for that language (English etc.), then RU, then the key itself."""
     val = await _db_get_string(get_pool(), key, lang)
     if val is None:
-        val = DEFAULTS.get(key, key)
+        val = DEFAULTS_BY_LANG.get(lang, {}).get(key) or DEFAULTS.get(key, key)
     if kwargs:
         try:
             return val.format(**kwargs)
@@ -50,5 +51,5 @@ async def t(key: str, lang: str = "ru", **kwargs) -> str:
 
 
 async def seed_defaults() -> None:
-    """Run once at startup to populate any missing RU rows."""
-    await _db_seed(get_pool(), DEFAULTS)
+    """Run once at startup to populate any missing rows for every shipped language."""
+    await _db_seed(get_pool(), DEFAULTS_BY_LANG)

@@ -12,6 +12,7 @@ from bot.database.queries import (
     get_all_displays, get_display_views_count,
     get_generation_stats, get_generation_by_day, get_top_generators,
     get_new_users_by_day, get_growth_stats, get_top_templates, get_links_overview,
+    get_organic_growth,
 )
 from bot.keyboards.admin import stats_menu, database_menu
 
@@ -110,6 +111,21 @@ def _build_stats_text(d: dict) -> str:
         f"<code>{_spark([r['cnt'] for r in nbd])}</code>  (макс/день {_fmt(max([r['cnt'] for r in nbd], default=0))})"
     )
 
+    # — Саморост (органика vs реклама) —
+    og = d["organic"]
+    L.append(
+        f"\n🌱 <b>Саморост</b> <i>(пришли НЕ по рекламе)</i>\n"
+        f"Сегодня: <b>+{_fmt(og['organic_today'])}</b> из {_fmt(og['new_today'])} "
+        f"({_pct(og['organic_today'], og['new_today'])}%)\n"
+        f"7 дней: <b>+{_fmt(og['organic_week'])}</b> из {_fmt(og['new_week'])} "
+        f"({_pct(og['organic_week'], og['new_week'])}%)  ·  "
+        f"30 дней: <b>+{_fmt(og['organic_month'])}</b> из {_fmt(og['new_month'])} "
+        f"({_pct(og['organic_month'], og['new_month'])}%)\n"
+        f"Всего органика: <b>{_fmt(og['organic_total'])}</b> "
+        f"({_pct(og['organic_total'], og['total'])}%)  ·  "
+        f"из рекламы: <b>{_fmt((og['total'] or 0) - (og['organic_total'] or 0))}</b>"
+    )
+
     # — Генерация гифок —
     gbd = d["gen_by_day"]
     L.append(
@@ -191,6 +207,7 @@ async def _gather_all_stats(pool) -> dict:
     return {
         "users":         await get_users_count(pool),
         "growth":        await get_growth_stats(pool),
+        "organic":       await get_organic_growth(pool),
         "new_by_day":    await get_new_users_by_day(pool, 7),
         "gen":           await get_generation_stats(pool),
         "gen_by_day":    await get_generation_by_day(pool, 7),
