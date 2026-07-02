@@ -45,6 +45,10 @@ class ModerationStates(StatesGroup):
     waiting_reject_comment = State()
 
 
+class GiftStates(StatesGroup):
+    waiting_username = State()   # кому дарим Гифыч Premium (@username получателя)
+
+
 class PlacementStates(StatesGroup):
     waiting_name = State()
     waiting_caption = State()

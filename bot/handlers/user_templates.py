@@ -4,19 +4,23 @@ import random
 import string
 
 from aiogram import Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery, Message, MessageEntity,
     InlineKeyboardMarkup, InlineKeyboardButton,
+    InputMediaAnimation, InputMediaVideo, InputMediaPhoto,
 )
 
 from bot.config import settings
 from bot.database import get_pool
 from bot.database.queries import add_user_template, get_bot_message, get_bot_buttons
+from bot.handlers.user_nav import _edit_with_msg
 from bot.keyboards.user import build_inline_kb, main_menu
 from bot.services.i18n import t, user_lang
 from bot.services.media_intake import video_to_animation
+from bot.services.query_parser import extract_emojis
 from bot.states.admin import UserTemplateStates
 
 
@@ -48,6 +52,11 @@ def _cancel_kb(label: str) -> InlineKeyboardMarkup:
 
 
 async def _choose_type_kb(lang: str) -> InlineKeyboardMarkup:
+    # Кнопки чузера живут в bot_buttons (key=tpl_choose_menu): каждую можно менять
+    # отдельно — текст, цвет, прем-иконку — через админку «Кнопки», как у main_menu.
+    rows = await get_bot_buttons(get_pool(), "tpl_choose_menu", lang)
+    if rows:
+        return build_inline_kb(rows)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=await t("tpl.add_quick", lang), callback_data="utpl:quick")],
         [InlineKeyboardButton(text=await t("tpl.add_public", lang), callback_data="utpl:public")],
@@ -57,31 +66,46 @@ async def _choose_type_kb(lang: str) -> InlineKeyboardMarkup:
 
 async def _replace_panel(bot, chat_id: int, old_mid: int, text: str, kb,
                          parse_mode: str = "HTML", entities=None, state: FSMContext = None):
-    """Удалить предыдущее сообщение-панель и прислать новое ТЕКСТОВОЕ. Нужно потому, что
-    панель могла быть медиа-сообщением (у chooser'а гифка из менюшки), а на следующих
-    шагах гифка уже не нужна — поэтому не редактируем in-place, а пересоздаём чистым
-    текстом. Если передан state — обновляем в нём pm_cid/pm_mid (для промежуточных шагов,
-    где следующий хендлер будет работать с этим же сообщением)."""
-    if old_mid:
-        try:
-            await bot.delete_message(chat_id, old_mid)
-        except Exception:
-            pass
+    """Показать следующий ТЕКСТОВЫЙ шаг панели. Сначала пробуем отредактировать старое
+    сообщение на месте (переход без «мигания», как в мемере). Если панель была
+    медиа-сообщением (у chooser'а гифка из менюшки) — текстом её не отредактировать,
+    тогда пересоздаём: удаляем и шлём новое. Если передан state — обновляем в нём
+    pm_cid/pm_mid (следующий хендлер работает с этим же сообщением)."""
     kw = {"reply_markup": kb}
     if entities:
         kw["entities"] = entities
     else:
         kw["parse_mode"] = parse_mode
+    if old_mid:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=old_mid, **kw)
+            if state is not None:
+                await state.update_data(pm_cid=chat_id, pm_mid=old_mid)
+            return None
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e):
+                if state is not None:
+                    await state.update_data(pm_cid=chat_id, pm_mid=old_mid)
+                return None
+        except Exception:
+            pass
+        try:
+            await bot.delete_message(chat_id, old_mid)
+        except Exception:
+            pass
     sent = await bot.send_message(chat_id, text, **kw)
     if state is not None:
         await state.update_data(pm_cid=sent.chat.id, pm_mid=sent.message_id)
     return sent
 
 
-async def _send_chooser(message: Message, lang: str) -> Message:
+async def _send_chooser(message: Message, lang: str, edit_from: Message | None = None) -> Message:
     """Экран «Каким способом добавить шаблон?». Если к нему в админке прикреплено медиа
     (видео/гиф/фото) — шлём ОДНИМ сообщением: медиа + подпись(text) + кнопки. Возвращаем
-    это сообщение (его id кладём в pm_mid — на нём строится дальнейший флоу)."""
+    это сообщение (его id кладём в pm_mid — на нём строится дальнейший флоу).
+
+    edit_from — прежняя менюшка: если её тип совпадает с чузером (медиа↔медиа или
+    текст↔текст), редактируем НА МЕСТЕ — переход плавный, без удаления/пересоздания."""
     pool = get_pool()
     msg = await get_bot_message(pool, "tpl.add_choose_type", lang)
     kb = await _choose_type_kb(lang)
@@ -96,6 +120,39 @@ async def _send_chooser(message: Message, lang: str) -> Message:
         lang, len(text), ftype,
         [(e.type, e.offset, e.length, e.custom_emoji_id) for e in (ents or [])],
     )
+    if edit_from is not None:
+        cur_is_media = edit_from.content_type in ("animation", "video", "photo")
+        can_edit = (bool(fid) and cur_is_media) or (not fid and not cur_is_media)
+        if can_edit:
+            for attempt_ents in ([ents, None] if ents else [None]):
+                try:
+                    if fid:
+                        ikw = {"media": fid, "caption": text or None}
+                        if attempt_ents:
+                            ikw["caption_entities"] = attempt_ents
+                            ikw["parse_mode"] = None
+                        else:
+                            ikw["parse_mode"] = "HTML"
+                        cls = (InputMediaVideo if ftype == "video"
+                               else InputMediaPhoto if ftype == "photo"
+                               else InputMediaAnimation)
+                        edited = await edit_from.edit_media(cls(**ikw), reply_markup=kb)
+                    elif attempt_ents:
+                        edited = await edit_from.edit_text(text, entities=attempt_ents, parse_mode=None, reply_markup=kb)
+                    else:
+                        edited = await edit_from.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                    return edited if isinstance(edited, Message) else edit_from
+                except TelegramBadRequest as e:
+                    if "message is not modified" in str(e):
+                        return edit_from
+                    logger.warning("CHOOSER in-place edit failed (ents=%s): %s", bool(attempt_ents), e)
+                except Exception as e:
+                    logger.warning("CHOOSER in-place edit failed (ents=%s): %s", bool(attempt_ents), e)
+        # Тип сообщения не совпал или редактирование не прошло — пересоздаём.
+        try:
+            await edit_from.delete()
+        except Exception:
+            pass
     if fid:
         # Шлём медиа+подпись+кнопки одним сообщением; если Телеграм отвергнет энтити
         # (напр. недоступный прем-эмодзи) — повторяем БЕЗ энтитей, чтобы экран не падал.
@@ -131,13 +188,9 @@ async def _send_chooser(message: Message, lang: str) -> Message:
 async def cb_add_user_template(callback: CallbackQuery, state: FSMContext):
     lang = await user_lang(callback.from_user.id)
     await state.set_state(UserTemplateStates.choosing_type)
-    # Меню могло быть медиа-сообщением → не редактируем, а пересоздаём экраном выбора
-    # (он сам покажет своё медиа, если задано).
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-    sent = await _send_chooser(callback.message, lang)
+    # Меню → чузер: редактируем на месте, когда типы совпадают (медиа↔медиа /
+    # текст↔текст) — переход плавный; иначе _send_chooser сам пересоздаст.
+    sent = await _send_chooser(callback.message, lang, edit_from=callback.message)
     await state.update_data(pm_cid=sent.chat.id, pm_mid=sent.message_id)
     await callback.answer()
 
@@ -287,40 +340,9 @@ async def cb_cancel_add(callback: CallbackQuery, state: FSMContext):
     msg = await get_bot_message(pool, "welcome", lang)
     btn_rows = await get_bot_buttons(pool, "main_menu", lang)
     kb = build_inline_kb(btn_rows) if btn_rows else main_menu()
-    text = msg["text"] or await t("common.menu", lang)
-    ents = None
-    if msg.get("entities"):
-        ents = [MessageEntity(**{k: v for k, v in e.items()}) for e in msg["entities"]]
-    # Панель могла стать медиа-сообщением (если у chooser'а была гифка). Текст ↔ медиа
-    # in-place не конвертируется, поэтому пересоздаём сообщение под welcome.
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-    fid, ftype = msg.get("file_id"), msg.get("file_type")
-    m = callback.message
-    if fid:
-        kw = {"caption": text or None, "reply_markup": kb}
-        if ents:
-            kw["caption_entities"] = ents
-            kw["parse_mode"] = None
-        else:
-            kw["parse_mode"] = "HTML"
-        try:
-            if ftype == "video":
-                await m.answer_video(fid, **kw)
-            elif ftype == "photo":
-                await m.answer_photo(fid, **kw)
-            else:
-                await m.answer_animation(fid, **kw)
-            await callback.answer()
-            return
-        except Exception:
-            pass
-    if ents:
-        await m.answer(text, entities=ents, parse_mode=None, reply_markup=kb)
-    else:
-        await m.answer(text, parse_mode="HTML", reply_markup=kb)
+    # Чузер → главное меню: _edit_with_msg редактирует на месте, когда типы совпадают
+    # (медиа↔медиа / текст↔текст), и пересоздаёт только когда иначе нельзя.
+    await _edit_with_msg(callback, msg, await t("common.menu", lang), kb)
     await callback.answer()
 
 
@@ -421,25 +443,10 @@ async def handle_user_media(message: Message, state: FSMContext):
 
 @router.message(UserTemplateStates.waiting_tags)
 async def handle_user_tags(message: Message, state: FSMContext):
-    import re
     lang = await user_lang(message.from_user.id)
-    text = message.text or ""
-    emoji_pattern = re.compile(
-        "[\U0001F000-\U0001FFFF"
-        "\U00002600-\U000027BF"
-        "\U0001F300-\U0001F9FF"
-        "\U0001FA00-\U0001FA9F"
-        "\U0001FAA0-\U0001FAFF"
-        "]+",
-        flags=re.UNICODE,
-    )
-    tags = emoji_pattern.findall(text)
-    split_tags = []
-    for s in tags:
-        for ch in s:
-            if ch.strip():
-                split_tags.append(ch)
-    tags = list(dict.fromkeys(split_tags))[:5]
+    # Та же нормализация, что у админских тегов и у инлайн-поиска (см. query_parser) —
+    # иначе сохранённый тег байтово не совпадает с эмодзи из поиска и ничего не находится.
+    tags = extract_emojis(message.text or "")[:5]
 
     try:
         await message.delete()

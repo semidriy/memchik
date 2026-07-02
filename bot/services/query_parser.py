@@ -36,6 +36,62 @@ _EMOJI_RE = re.compile(
 )
 
 
+# Теги в БД сравниваются с поиском ПОСТРОЧНО (tags && array — точное равенство строк).
+# Поэтому обе стороны обязаны приводить эмодзи к ОДНОЙ канонической форме:
+#  - слитную строку "😂🤣" режем на отдельные эмодзи (раньше findall возвращал весь
+#    «ран» одной строкой → тег "😂🤣" не находился по "😂");
+#  - выкидываем вариационные селекторы FE0E/FE0F — один клиент шлёт "⭐️" (со
+#    селектором), другой "⭐" (без), байтово это разные строки.
+_VS = {0xFE0E, 0xFE0F}
+_ZWJ = 0x200D
+_KEYCAP = 0x20E3
+_SKIN_LO, _SKIN_HI = 0x1F3FB, 0x1F3FF          # модификаторы тона кожи
+_REG_LO, _REG_HI = 0x1F1E6, 0x1F1FF            # региональные индикаторы (флаги 🇷🇺)
+
+
+def _split_run(run: str) -> list[str]:
+    """Порезать слитный ран эмодзи на отдельные кластеры: пары флагов, тона кожи,
+    ZWJ-последовательности (👨‍👩‍👧) остаются одним эмодзи; FE0E/FE0F выбрасываются."""
+    out: list[str] = []
+    i, n = 0, len(run)
+    while i < n:
+        cp = ord(run[i])
+        if cp in _VS or cp == _ZWJ or cp == _KEYCAP:
+            i += 1  # осиротевший модификатор без базового символа — пропускаем
+            continue
+        cluster = [run[i]]
+        i += 1
+        if _REG_LO <= cp <= _REG_HI and i < n and _REG_LO <= ord(run[i]) <= _REG_HI:
+            cluster.append(run[i])  # флаг = ровно пара региональных индикаторов
+            i += 1
+        else:
+            while i < n:
+                nc = ord(run[i])
+                if nc in _VS:
+                    i += 1  # каноническая форма — без селекторов
+                elif _SKIN_LO <= nc <= _SKIN_HI or nc == _KEYCAP:
+                    cluster.append(run[i])
+                    i += 1
+                elif nc == _ZWJ and i + 1 < n and ord(run[i + 1]) not in _VS and ord(run[i + 1]) != _ZWJ:
+                    cluster.append(run[i])
+                    cluster.append(run[i + 1])
+                    i += 2
+                else:
+                    break
+        out.append("".join(cluster))
+    return out
+
+
+def extract_emojis(text: str) -> list[str]:
+    """Все эмодзи текста, по одному, в канонической форме (без дублей)."""
+    out: list[str] = []
+    for run in _EMOJI_RE.findall(text):
+        for e in _split_run(run):
+            if e not in out:
+                out.append(e)
+    return out
+
+
 def parse_inline_query(raw: str) -> tuple[list[str], str]:
     """
     "👋 привет"  ->  (["👋"], "привет")
@@ -51,12 +107,8 @@ def parse_inline_query(raw: str) -> tuple[list[str], str]:
     first = parts[0]
 
     if not _EMOJI_RE.sub("", first).strip():
-        emojis = _EMOJI_RE.findall(first)
+        emojis = extract_emojis(first)
         overlay = parts[1].strip() if len(parts) > 1 else ""
         return emojis, overlay
 
     return [], text
-
-
-def extract_emojis(text: str) -> list[str]:
-    return _EMOJI_RE.findall(text)

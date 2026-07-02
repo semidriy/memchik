@@ -14,6 +14,7 @@ from bot.database.queries import (
     get_template, approve_template, reject_template, delete_template,
 )
 from bot.keyboards.admin import moderation_kb
+from bot.services.i18n import t as i18n_t, user_lang
 from bot.services.permissions import has_permission, PERM_MODERATION
 from bot.states.admin import ModerationStates
 
@@ -52,9 +53,10 @@ async def cb_approve(callback: CallbackQuery):
     await callback.answer("✅ Одобрено")
     if t.get("submitted_by"):
         try:
+            lang = await user_lang(t["submitted_by"])
             await callback.bot.send_message(
                 t["submitted_by"],
-                "✅ Ваш шаблон одобрен и теперь доступен всем в @гифыч_media!",
+                await i18n_t("mod.approved_user", lang),
             )
         except Exception:
             pass
@@ -108,11 +110,12 @@ async def cb_reject(callback: CallbackQuery):
     await callback.answer("❌ Отклонено")
     if t.get("submitted_by"):
         try:
+            lang = await user_lang(t["submitted_by"])
             await callback.bot.send_message(
                 t["submitted_by"],
-                "❌ Ваш шаблон не прошёл модерацию.",
+                await i18n_t("mod.rejected_user", lang),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="➕ Добавить другой", callback_data="template:add_user"),
+                    InlineKeyboardButton(text=await i18n_t("tpl.add_another", lang), callback_data="template:add_user"),
                 ]]),
             )
         except Exception:
@@ -239,11 +242,12 @@ async def handle_reject_comment(message: Message, state: FSMContext):
 
     if t.get("submitted_by"):
         try:
+            lang = await user_lang(t["submitted_by"])
             await message.bot.send_message(
                 t["submitted_by"],
-                f"❌ Ваш шаблон не прошёл модерацию.\nПричина: {comment}",
+                await i18n_t("mod.rejected_reason_user", lang, reason=comment),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="➕ Добавить другой", callback_data="template:add_user"),
+                    InlineKeyboardButton(text=await i18n_t("tpl.add_another", lang), callback_data="template:add_user"),
                 ]]),
             )
         except Exception:

@@ -18,12 +18,6 @@ class Settings(BaseSettings):
     personal_channel_id: int | None = None     # личные (быстрые) шаблоны — лог с удалением
     public_channel_id: int | None = None       # витрина одобренных шаблонов
 
-    # Прем-эмодзи на кнопках (icon_custom_emoji_id) работают ТОЛЬКО если у аккаунта
-    # бота есть Telegram Premium / имя с Fragment. Без этого Telegram рисует такие
-    # кнопки БЛЁКЛО. Поэтому по умолчанию иконки не шлём (кнопки нормальные); включи
-    # BOT_HAS_PREMIUM=1 в .env, когда у бота будет премка.
-    bot_has_premium: bool = False
-
     # Media server
     media_server_url: str = ""        # e.g. https://tgp.tgis.vu
     media_server_secret: str = ""     # HMAC secret shared between bot and media server

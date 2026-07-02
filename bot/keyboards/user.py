@@ -1,7 +1,5 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from bot.config import settings
-
 
 def op_check_keyboard(channels: list[dict], link_code: str | None = None) -> InlineKeyboardMarkup:
     rows = []
@@ -61,9 +59,7 @@ def build_inline_kb(rows: list[list[dict]]) -> InlineKeyboardMarkup:
             kwargs = {"text": btn["text"]}
             if style:
                 kwargs["style"] = style
-            # Прем-иконку шлём ТОЛЬКО если у бота есть премка — иначе Telegram рисует
-            # кнопку блёкло. Без премки кнопка просто без иконки, но нормальная.
-            if emoji_id and settings.bot_has_premium:
+            if emoji_id:
                 kwargs["icon_custom_emoji_id"] = emoji_id
             if "url" in btn:
                 kb_row.append(InlineKeyboardButton(url=btn["url"], **kwargs))

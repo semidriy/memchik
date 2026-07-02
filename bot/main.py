@@ -62,6 +62,14 @@ async def main():
         await seed_i18n_defaults()
     except Exception as e:
         logger.warning("seed_i18n_defaults failed: %s", e)
+    try:
+        from bot.database import get_pool
+        from bot.database.queries import renormalize_all_template_tags
+        fixed = await renormalize_all_template_tags(get_pool())
+        if fixed:
+            logger.info("tag renormalization: fixed %d templates", fixed)
+    except Exception as e:
+        logger.warning("tag renormalization failed: %s", e)
     from bot.version import BOT_VERSION
     logger.info("Bot started (version %s), pre-warming template cache...", BOT_VERSION)
     asyncio.create_task(prewarm_templates(bot))

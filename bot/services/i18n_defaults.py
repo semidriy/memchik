@@ -38,7 +38,15 @@ DEFAULTS: dict[str, str] = {
     "premium.buy_999y": "⭐ 999 лет — 49 ⭐",
     "premium.stars_buy": "🛍 Купить Telegram Stars ↗",
     "premium.gift_btn": "🎁 Подарить Гифыч Premium",
-    "premium.gift_alert": "Для подарка напишите @гифыч и укажите username получателя.",
+    "premium.gift_ask": (
+        "🎁 <b>Подарить Гифыч Premium</b>\n\n"
+        "Отправь @username получателя.\n"
+        "⚠️ Получатель должен был хотя бы раз запустить бота."
+    ),
+    "premium.gift_not_found": "😕 Пользователь не найден — он должен хотя бы раз запустить бота.\nПопробуй другой @username:",
+    "premium.gift_choose": "🎁 Даришь Premium для <b>{name}</b>. Выбери период:",
+    "premium.gift_sent": "✅ Подарок оплачен! Гифыч Premium активирован для {name}.",
+    "premium.gift_received": "🎁 Вам подарили Гифыч Premium — {plan}!\nУже активен, приятного пользования.",
     "premium.plan_1m": "Гифыч Premium — 1 месяц",
     "premium.plan_6m": "Гифыч Premium — 6 месяцев",
     "premium.plan_12m": "Гифыч Premium — 12 месяцев",
@@ -79,6 +87,11 @@ DEFAULTS: dict[str, str] = {
     "meme.too_long": "Максимум 100 символов",
     "meme.restart": "Что-то пошло не так, начни заново — /start",
     "meme.error": "❌ Ошибка: {err}",
+
+    # --- Moderation → уведомления пользователю ---
+    "mod.approved_user": "✅ Ваш шаблон одобрен и теперь доступен всем в @гифыч_media!",
+    "mod.rejected_user": "❌ Ваш шаблон не прошёл модерацию.",
+    "mod.rejected_reason_user": "❌ Ваш шаблон не прошёл модерацию.\nПричина: {reason}",
 
     # --- Start / OP ---
     "start.bad_link": "Неверная ссылка",
@@ -128,7 +141,15 @@ DEFAULTS_EN: dict[str, str] = {
     "premium.buy_999y": "⭐ 999 years — 49 ⭐",
     "premium.stars_buy": "🛍 Buy Telegram Stars ↗",
     "premium.gift_btn": "🎁 Gift Gifych Premium",
-    "premium.gift_alert": "To gift, message @гифыч with the recipient's username.",
+    "premium.gift_ask": (
+        "🎁 <b>Gift Gifych Premium</b>\n\n"
+        "Send the recipient's @username.\n"
+        "⚠️ The recipient must have started the bot at least once."
+    ),
+    "premium.gift_not_found": "😕 User not found — they must start the bot at least once.\nTry another @username:",
+    "premium.gift_choose": "🎁 Gifting Premium to <b>{name}</b>. Choose a period:",
+    "premium.gift_sent": "✅ Gift paid! Gifych Premium is now active for {name}.",
+    "premium.gift_received": "🎁 You've been gifted Gifych Premium — {plan}!\nIt's already active, enjoy.",
     "premium.plan_1m": "Gifych Premium — 1 month",
     "premium.plan_6m": "Gifych Premium — 6 months",
     "premium.plan_12m": "Gifych Premium — 12 months",
@@ -169,6 +190,11 @@ DEFAULTS_EN: dict[str, str] = {
     "meme.too_long": "100 characters max",
     "meme.restart": "Something went wrong, start over — /start",
     "meme.error": "❌ Error: {err}",
+
+    # --- Moderation → user notifications ---
+    "mod.approved_user": "✅ Your template was approved and is now available to everyone in @гифыч!",
+    "mod.rejected_user": "❌ Your template didn't pass moderation.",
+    "mod.rejected_reason_user": "❌ Your template didn't pass moderation.\nReason: {reason}",
 
     # --- Start / OP ---
     "start.bad_link": "Invalid link",

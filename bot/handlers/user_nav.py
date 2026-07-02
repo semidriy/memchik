@@ -2,6 +2,7 @@ from datetime import datetime, timezone, timedelta
 
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery, Message, MessageEntity,
     InlineKeyboardMarkup, InlineKeyboardButton,
@@ -13,10 +14,11 @@ from bot.database import get_pool
 from bot.database.queries import (
     get_bot_buttons, get_bot_message,
     get_languages, set_user_lang,
-    set_user_bot_premium,
+    set_user_bot_premium, get_user, get_user_by_username,
 )
 from bot.keyboards.user import build_inline_kb, main_menu
 from bot.services.i18n import t, user_lang, invalidate_lang_cache
+from bot.states.admin import GiftStates
 
 router = Router()
 
@@ -254,10 +256,107 @@ async def cb_premium_buy(callback: CallbackQuery):
     await callback.answer()
 
 
+def _esc(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def _gift_cancel_kb(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=await t("common.cancel", lang), callback_data="premium:gift_cancel")],
+    ])
+
+
 @router.callback_query(F.data == "premium:gift")
-async def cb_premium_gift(callback: CallbackQuery):
+async def cb_premium_gift(callback: CallbackQuery, state: FSMContext):
     lang = await user_lang(callback.from_user.id)
-    await callback.answer(await t("premium.gift_alert", lang), show_alert=True)
+    await state.set_state(GiftStates.waiting_username)
+    # Меню премиума может быть медиа-сообщением — не редактируем его, а шлём отдельную
+    # панель подарка (меню остаётся на месте, к нему можно вернуться).
+    sent = await callback.message.answer(
+        await t("premium.gift_ask", lang),
+        parse_mode="HTML",
+        reply_markup=await _gift_cancel_kb(lang),
+    )
+    await state.update_data(pm_cid=sent.chat.id, pm_mid=sent.message_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "premium:gift_cancel")
+async def cb_premium_gift_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.message(GiftStates.waiting_username, F.text)
+async def handle_gift_username(message: Message, state: FSMContext):
+    lang = await user_lang(message.from_user.id)
+    raw = (message.text or "").strip()
+    username = raw.replace("https://t.me/", "").replace("t.me/", "").lstrip("@").strip("/ ")
+    data = await state.get_data()
+    pm_cid, pm_mid = data.get("pm_cid"), data.get("pm_mid")
+    if not pm_mid:
+        # Панель потерялась (например, рестарт бота) — пересоздаём её.
+        sent = await message.answer(await t("premium.gift_ask", lang), parse_mode="HTML",
+                                    reply_markup=await _gift_cancel_kb(lang))
+        pm_cid, pm_mid = sent.chat.id, sent.message_id
+        await state.update_data(pm_cid=pm_cid, pm_mid=pm_mid)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    recipient = await get_user_by_username(get_pool(), username) if username else None
+    if not recipient:
+        try:
+            await message.bot.edit_message_text(
+                await t("premium.gift_not_found", lang),
+                chat_id=pm_cid, message_id=pm_mid,
+                parse_mode="HTML",
+                reply_markup=await _gift_cancel_kb(lang),
+            )
+        except TelegramBadRequest:
+            pass
+        return
+
+    await state.clear()
+    uid = recipient["id"]
+    name = recipient.get("first_name") or f"@{recipient.get('username')}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=await t("premium.buy_1m", lang), callback_data=f"premium:giftbuy:1m:9:{uid}")],
+        [InlineKeyboardButton(text=await t("premium.buy_6m", lang), callback_data=f"premium:giftbuy:6m:15:{uid}")],
+        [InlineKeyboardButton(text=await t("premium.buy_12m", lang), callback_data=f"premium:giftbuy:12m:27:{uid}")],
+        [InlineKeyboardButton(text=await t("premium.buy_999y", lang), callback_data=f"premium:giftbuy:999y:49:{uid}")],
+        [InlineKeyboardButton(text=await t("common.cancel", lang), callback_data="premium:gift_cancel")],
+    ])
+    await message.bot.edit_message_text(
+        await t("premium.gift_choose", lang, name=_esc(name)),
+        chat_id=pm_cid, message_id=pm_mid,
+        parse_mode="HTML", reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("premium:giftbuy:"))
+async def cb_premium_gift_buy(callback: CallbackQuery):
+    lang = await user_lang(callback.from_user.id)
+    parts = callback.data.split(":")
+    plan, stars_str, uid_str = parts[2], parts[3], parts[4]
+    stars, recipient_id = int(stars_str), int(uid_str)
+    plan_key = _PLAN_KEYS.get(plan, "premium.title")
+    label = await t(plan_key, lang)
+    await callback.bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title=f"🎁 {label}",
+        description=await t("premium.invoice_desc", lang),
+        payload=f"gift_{plan}_{recipient_id}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label=label, amount=stars)],
+    )
+    await callback.answer()
 
 
 @router.pre_checkout_query()
@@ -278,8 +377,34 @@ async def successful_payment(message: Message):
     lang = await user_lang(message.from_user.id)
     payload = message.successful_payment.invoice_payload
     stars = message.successful_payment.total_amount
+    pool = get_pool()
+
+    # Подарок: payload = gift_{plan}_{recipient_id} — премиум активируем ПОЛУЧАТЕЛЮ.
+    if payload.startswith("gift_"):
+        try:
+            _, plan, uid_str = payload.split("_", 2)
+            recipient_id = int(uid_str)
+        except ValueError:
+            recipient_id = None
+        if recipient_id:
+            days = _PLAN_DAYS.get(f"premium_{plan}", 30)
+            until = datetime.now(timezone.utc) + timedelta(days=days)
+            await set_user_bot_premium(pool, recipient_id, until)
+            recipient = await get_user(pool, recipient_id) or {}
+            name = recipient.get("first_name") or recipient.get("username") or str(recipient_id)
+            await message.answer(await t("premium.gift_sent", lang, name=name))
+            try:
+                r_lang = await user_lang(recipient_id)
+                plan_label = await t(_PLAN_KEYS.get(plan, "premium.title"), r_lang)
+                await message.bot.send_message(
+                    recipient_id,
+                    await t("premium.gift_received", r_lang, plan=plan_label),
+                )
+            except Exception:
+                pass
+            return
+
     days = _PLAN_DAYS.get(payload, 30)
     until = datetime.now(timezone.utc) + timedelta(days=days)
-    pool = get_pool()
     await set_user_bot_premium(pool, message.from_user.id, until)
     await message.answer(await t("premium.activated", lang, stars=stars))

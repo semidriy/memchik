@@ -36,6 +36,15 @@ async def get_user(pool: Pool, user_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+async def get_user_by_username(pool: Pool, username: str) -> dict | None:
+    """Для «подарить премку»: получатель ищется среди тех, кто запускал бота."""
+    row = await pool.fetchrow(
+        "SELECT * FROM users WHERE lower(username) = lower($1) ORDER BY last_active DESC LIMIT 1",
+        username.lstrip("@"),
+    )
+    return dict(row) if row else None
+
+
 async def set_user_bot_premium(pool: Pool, user_id: int, until: datetime) -> None:
     await pool.execute(
         "UPDATE users SET premium_until = $1 WHERE id = $2",
@@ -624,6 +633,26 @@ async def update_template_tags(pool: Pool, template_id: int, tags: list[str]):
     )
 
 
+async def renormalize_all_template_tags(pool: Pool) -> int:
+    """Одноразовый проход на старте: привести уже сохранённые теги к канонической
+    форме query_parser.extract_emojis (порезать слитные "😂🤣", убрать FE0F).
+    Иначе старые теги, записанные до фикса, так и не находились бы поиском."""
+    from bot.services.query_parser import extract_emojis
+    rows = await pool.fetch("SELECT id, tags FROM templates WHERE tags IS NOT NULL AND tags <> '{}'")
+    fixed = 0
+    for r in rows:
+        old = list(r["tags"])
+        new: list[str] = []
+        for tag in old:
+            for e in extract_emojis(tag):
+                if e not in new:
+                    new.append(e)
+        if new != old:
+            await pool.execute("UPDATE templates SET tags = $1::text[] WHERE id = $2", new, r["id"])
+            fixed += 1
+    return fixed
+
+
 async def get_template(pool: Pool, template_id: int) -> dict | None:
     row = await pool.fetchrow("SELECT * FROM templates WHERE id = $1", template_id)
     return dict(row) if row else None
@@ -1031,6 +1060,13 @@ _BTN_DEFAULTS: dict[str, list] = {
         ],
         [{"text": "⬅ Назад", "callback_data": "premium:back"}],
     ],
+    # Экран «Каким способом добавить шаблон?» — кнопки редактируются ПОШТУЧНО
+    # (текст/цвет/прем-иконка) через админку, как у остальных менюшек.
+    "tpl_choose_menu": [
+        [{"text": "⚡ Быстро добавить", "callback_data": "utpl:quick"}],
+        [{"text": "🌐 Публичный шаблон", "callback_data": "utpl:public"}],
+        [{"text": "❌ Отмена", "callback_data": "utpl:cancel"}],
+    ],
 }
 
 # English fallbacks for menu texts/buttons so selecting English actually switches the
@@ -1079,6 +1115,11 @@ _BTN_DEFAULTS_EN: dict[str, list] = {
             {"text": "🎁 Gift", "callback_data": "premium:gift"},
         ],
         [{"text": "⬅ Back", "callback_data": "premium:back"}],
+    ],
+    "tpl_choose_menu": [
+        [{"text": "⚡ Quick add", "callback_data": "utpl:quick"}],
+        [{"text": "🌐 Public template", "callback_data": "utpl:public"}],
+        [{"text": "❌ Cancel", "callback_data": "utpl:cancel"}],
     ],
 }
 
