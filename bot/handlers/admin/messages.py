@@ -29,6 +29,11 @@ class BtnAddStates(StatesGroup):
     color = State()
 
 
+class BtnEditStates(StatesGroup):
+    # Редактирование ОДНОЙ уже существующей кнопки (текст) — цель (row,col) в FSM data.
+    text = State()
+
+
 from bot.services.permissions import has_permission, PERM_MESSAGES
 
 
@@ -252,14 +257,49 @@ def _btn_preview(rows: list) -> str:
 
 
 def _btn_edit_kb(key: str, rows: list) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    kb: list = []
+    # Каждая существующая кнопка — отдельная строка-«ручка»: нажми, чтобы поменять
+    # именно её (текст/цвет/удалить). Раньше можно было только добавить/снять последнюю,
+    # из-за чего текст двух кнопок было не развести по отдельности.
+    for r, row in enumerate(rows):
+        for c, b in enumerate(row):
+            icon = _STYLE_ICON.get(b.get("style"), "")
+            emoji_mark = "✨" if b.get("icon_custom_emoji_id") else ""
+            label = (b.get("text") or "")[:24]
+            kb.append([InlineKeyboardButton(
+                text=f"✏️ {emoji_mark}{icon}{label}",
+                callback_data=f"msg:be:{r}:{c}",
+            )])
+    kb += [
         [InlineKeyboardButton(text="➕ Добавить кнопку (новый ряд)", callback_data=f"msg:btn_add:{key}:new")],
         [InlineKeyboardButton(text="➕ Добавить в последний ряд", callback_data=f"msg:btn_add:{key}:same")],
         [InlineKeyboardButton(text="🗑 Удалить последнюю", callback_data=f"msg:btn_del:{key}")],
         [InlineKeyboardButton(text="✅ Сохранить", callback_data=f"msg:btn_save:{key}")],
         [InlineKeyboardButton(text="🔄 Сбросить всё", callback_data=f"msg:btn_reset:{key}")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="msg:btn_cancel")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def _btn_item_kb(r: int, c: int) -> InlineKeyboardMarkup:
+    """Меню одной кнопки: сменить текст, задать цвет, удалить именно её."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить текст", callback_data=f"msg:bet:{r}:{c}")],
+        [
+            InlineKeyboardButton(text="🔵", callback_data=f"msg:becs:{r}:{c}:primary"),
+            InlineKeyboardButton(text="🟢", callback_data=f"msg:becs:{r}:{c}:success"),
+            InlineKeyboardButton(text="🔴", callback_data=f"msg:becs:{r}:{c}:danger"),
+            InlineKeyboardButton(text="⬜", callback_data=f"msg:becs:{r}:{c}:none"),
+        ],
+        [InlineKeyboardButton(text="🗑 Удалить эту кнопку", callback_data=f"msg:bed:{r}:{c}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="msg:be_back")],
     ])
+
+
+def _get_entry(rows: list, r: int, c: int) -> dict | None:
+    if 0 <= r < len(rows) and 0 <= c < len(rows[r]):
+        return rows[r][c]
+    return None
 
 
 async def _show_btn_editor(target, key: str, rows: list, state: FSMContext):
@@ -342,6 +382,130 @@ async def cb_btn_save(callback: CallbackQuery, state: FSMContext):
         reply_markup=_buttons_list_kb(buttons),
     )
     await callback.answer("Сохранено!")
+
+
+# --- Per-button editing (change ONE button's text / color / delete it) ---
+
+@router.callback_query(F.data.startswith("msg:be:"))
+async def cb_btn_item(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    _, _, r_s, c_s = callback.data.split(":")
+    r, c = int(r_s), int(c_s)
+    data = await state.get_data()
+    rows = data.get("edit_rows") or []
+    entry = _get_entry(rows, r, c)
+    if entry is None:
+        await callback.answer("Кнопка не найдена", show_alert=True)
+        return
+    await state.update_data(edit_r=r, edit_c=c,
+                            pm_cid=callback.message.chat.id, pm_mid=callback.message.message_id)
+    style = entry.get("style") or "нет"
+    emoji = "✨ есть" if entry.get("icon_custom_emoji_id") else "нет"
+    dest = entry.get("url") or entry.get("callback_data") or "?"
+    await callback.message.edit_text(
+        f"🔘 Кнопка: <b>{entry.get('text', '')}</b>\n"
+        f"Цвет: {style} · прем-иконка: {emoji}\n"
+        f"Действие: <code>{dest}</code>\n\nЧто изменить?",
+        parse_mode="HTML", reply_markup=_btn_item_kb(r, c),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "msg:be_back")
+async def cb_btn_item_back(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    await state.set_state(None)
+    data = await state.get_data()
+    key = data.get("edit_key")
+    rows = data.get("edit_rows") or []
+    if not key:
+        await cb_btn_cancel(callback, state)
+        return
+    await _show_btn_editor(callback, key, rows, state)
+
+
+@router.callback_query(F.data.startswith("msg:bet:"))
+async def cb_btn_item_text(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    _, _, r_s, c_s = callback.data.split(":")
+    await state.update_data(edit_r=int(r_s), edit_c=int(c_s),
+                            pm_cid=callback.message.chat.id, pm_mid=callback.message.message_id)
+    await state.set_state(BtnEditStates.text)
+    await callback.message.edit_text(
+        "✏️ Пришли новый текст для этой кнопки:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="msg:be_back")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.message(BtnEditStates.text)
+async def step_item_text(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+    if not text:
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    data = await state.get_data()
+    rows = data.get("edit_rows") or []
+    entry = _get_entry(rows, data.get("edit_r"), data.get("edit_c"))
+    if entry is not None:
+        entry["text"] = text
+    await state.set_state(None)
+    await state.update_data(edit_rows=rows)
+    await _show_btn_editor(
+        (message.bot, data["pm_cid"], data["pm_mid"]),
+        data["edit_key"], rows, state,
+    )
+
+
+@router.callback_query(F.data.startswith("msg:becs:"))
+async def cb_btn_item_color(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    parts = callback.data.split(":")  # msg:becs:R:C:COLOR
+    r, c, color = int(parts[2]), int(parts[3]), parts[4]
+    data = await state.get_data()
+    rows = data.get("edit_rows") or []
+    entry = _get_entry(rows, r, c)
+    if entry is None:
+        await callback.answer("Кнопка не найдена", show_alert=True)
+        return
+    if color == "none":
+        entry.pop("style", None)
+    else:
+        entry["style"] = color
+    await state.update_data(edit_rows=rows)
+    await _show_btn_editor(callback, data["edit_key"], rows, state)
+    await callback.answer("Цвет обновлён")
+
+
+@router.callback_query(F.data.startswith("msg:bed:"))
+async def cb_btn_item_del(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        return
+    parts = callback.data.split(":")  # msg:bed:R:C
+    r, c = int(parts[2]), int(parts[3])
+    data = await state.get_data()
+    rows: list = list(data.get("edit_rows") or [])
+    if 0 <= r < len(rows) and 0 <= c < len(rows[r]):
+        row = list(rows[r])
+        row.pop(c)
+        if row:
+            rows[r] = row
+        else:
+            rows.pop(r)
+    await state.update_data(edit_rows=rows)
+    await _show_btn_editor(callback, data["edit_key"], rows, state)
+    await callback.answer("Кнопка удалена")
 
 
 # --- Step-by-step button adding ---
