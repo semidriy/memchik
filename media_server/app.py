@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
 from PIL import Image
 
-from bot.config import settings
+from bot.config import settings, pick_cache_chat
 from bot.services.overlay import add_text_auto, render_static_preview, _ffmpeg_path, _first_frame_jpeg
 
 logger = logging.getLogger(__name__)
@@ -558,13 +558,23 @@ async def cache_to_telegram(
     method = "sendAnimation" if is_anim else "sendPhoto"
     field = "animation" if is_anim else "photo"
     filename = f"out.{ext}"
+    tg_url = f"https://api.telegram.org/bot{settings.bot_token}/{method}"
 
-    files = {field: (filename, data, ct)}
-    form = {"chat_id": str(settings.cache_chat_id)}
-    r = await _http.post(
-        f"https://api.telegram.org/bot{settings.bot_token}/{method}",
-        data=form, files=files, timeout=30.0,
-    )
+    async def _send(chat_id: int):
+        # files пересобираем на каждую попытку — httpx «съедает» тело при отправке.
+        return await _http.post(
+            tg_url, data={"chat_id": str(chat_id)},
+            files={field: (filename, data, ct)}, timeout=30.0,
+        )
+
+    # Раскидываем по каналам; при сбое доп. канала откатываемся на primary.
+    primary = settings.cache_chat_id
+    picked = pick_cache_chat(f"{template_id}:{text_hash}")
+    r = await _send(picked)
+    if r.status_code != 200 and picked != primary:
+        logger.warning("telegram %s to %s failed (%s), retry primary",
+                       method, picked, r.status_code)
+        r = await _send(primary)
     if r.status_code != 200:
         logger.warning("telegram %s failed for tpl=%s: %s", method, template_id, r.text[:200])
         raise HTTPException(status_code=502, detail="telegram upload failed")

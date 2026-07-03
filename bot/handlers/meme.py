@@ -5,7 +5,7 @@ from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
 
-from bot.config import settings
+from bot.config import settings, pick_cache_chat
 from bot.database import get_pool
 from bot.database.queries import (
     get_active_templates, get_templates_count, get_template,
@@ -153,29 +153,32 @@ async def handle_meme_text(message: Message, state: FSMContext):
         await state.clear()
 
 
+async def _send_to_cache(bot, chat_id: int, data: bytes, file_type: str) -> str:
+    if file_type == "animation":
+        sent = await bot.send_animation(chat_id, BufferedInputFile(data, filename="meme.gif"))
+        return sent.animation.file_id
+    sent = await bot.send_photo(chat_id, BufferedInputFile(data, filename="meme.jpg"))
+    return sent.photo[-1].file_id
+
+
 async def _upload_and_cache(message: Message, pool, data: bytes, file_type: str, template_id, text_hash: str) -> str:
-    try:
-        if file_type == "animation":
-            sent = await message.bot.send_animation(
-                settings.cache_chat_id,
-                BufferedInputFile(data, filename="meme.gif"),
-            )
-            file_id = sent.animation.file_id
-        else:
-            sent = await message.bot.send_photo(
-                settings.cache_chat_id,
-                BufferedInputFile(data, filename="meme.jpg"),
-            )
-            file_id = sent.photo[-1].file_id
+    # Пробуем выбранный (раскиданный) канал; если бот там не админ / канал битый —
+    # откатываемся на primary. Только если и primary не вышел — шлём юзеру напрямую.
+    primary = settings.cache_chat_id
+    picked = pick_cache_chat(f"{template_id}:{text_hash}")
+    targets = [picked] if picked == primary else [picked, primary]
+    for target in targets:
+        try:
+            file_id = await _send_to_cache(message.bot, target, data, file_type)
+            await save_gif_cache(pool, str(template_id), text_hash, file_id)
+            return file_id
+        except Exception as cache_err:
+            logger.warning("Cache upload to %s failed: %s", target, cache_err)
 
-        await save_gif_cache(pool, str(template_id), text_hash, file_id)
-        return file_id
-
-    except Exception as cache_err:
-        logger.warning("Cache chat upload failed (%s), sending directly to user", cache_err)
-        if file_type == "animation":
-            sent = await message.answer_animation(BufferedInputFile(data, filename="meme.gif"))
-            return sent.animation.file_id
-        else:
-            sent = await message.answer_photo(BufferedInputFile(data, filename="meme.jpg"))
-            return sent.photo[-1].file_id
+    logger.warning("All cache chats failed, sending directly to user")
+    if file_type == "animation":
+        sent = await message.answer_animation(BufferedInputFile(data, filename="meme.gif"))
+        return sent.animation.file_id
+    else:
+        sent = await message.answer_photo(BufferedInputFile(data, filename="meme.jpg"))
+        return sent.photo[-1].file_id

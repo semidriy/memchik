@@ -26,16 +26,26 @@ from bot.database.queries import (
     get_active_templates, get_templates_by_tags,
     record_inline_use, increment_template_use_count,
     get_eligible_placements_for_user, record_placement_send,
-    get_cached_gif, save_gif_cache, get_template, get_placement,
+    get_cached_gif, get_cached_gif_batch, save_gif_cache, get_template, get_placement,
     is_user_bot_premium,
 )
 from bot.services.query_parser import parse_inline_query
-from bot.services.inline_processor import build_preview_url, build_media_url, _sign
+from bot.services.inline_processor import build_preview_url, build_media_url, _sign, _text_hash
 from bot.services.i18n import t, user_lang
 
 router = Router()
 
 _UPLOAD_SEM = asyncio.Semaphore(16)
+
+# Держим ссылки на фоновые задачи заливки в кэш, иначе GC может убить их
+# до завершения (asyncio.create_task не хранит ссылку сам).
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_bg(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
 
 # Telegram supplies chat_type only on InlineQuery, not on ChosenInlineResult.
 # Cache user_id -> (chat_type, ts) at query time, look up at chosen time.
@@ -125,6 +135,24 @@ def _build_preview_result(template: dict, overlay_text: str, placement: dict | N
     return InlineQueryResultPhoto(
         id=rid, photo_url=url, thumbnail_url=url,
         photo_width=512, photo_height=512,
+        title=title, caption=caption, reply_markup=_result_markup(placement, next_label),
+    )
+
+
+def _build_cached_gif_result(template: dict, file_id: str, overlay_text: str,
+                             placement: dict | None, next_label: str = "🔁 Ещё мем"):
+    """Готовая gif с текстом уже залита в кэш-канал → есть её telegram file_id.
+    Отдаём как CachedMpeg4Gif: Телеграм тянет её со СВОЕГО CDN (медиасервер вообще
+    не дёргается), в выдаче она грузится мгновенно, а при отправке улетает уже
+    ГОТОВОЙ анимацией. Никакой правки сообщения после отправки не делаем →
+    НЕТ пометки «изменено» (в этом вся суть, как у @memer)."""
+    title = template["title"] or "GIF"
+    if overlay_text:
+        title = f'"{overlay_text}" • {title}'
+    caption = placement["caption_text"] if placement and placement.get("caption_text") else None
+    rid = _encode_result_id(template["id"], overlay_text, placement["id"] if placement else None)
+    return InlineQueryResultCachedMpeg4Gif(
+        id=rid, mpeg4_file_id=file_id,
         title=title, caption=caption, reply_markup=_result_markup(placement, next_label),
     )
 
@@ -223,10 +251,23 @@ async def handle_inline_query(query: InlineQuery):
     next_label = await t("inline.next_meme", lang)
 
     results = []
-    for tpl in templates:
-        if overlay_text:
-            results.append(_build_preview_result(tpl, overlay_text, placement, next_label))
-        else:
+    if overlay_text:
+        # Cache-first: для (шаблон, текст), которые УЖЕ залиты в кэш-канал, отдаём
+        # готовую анимацию по file_id (мгновенно, без правки → без «изменено»).
+        # Остальные пока показываем дешёвым статичным превью — они дозальются в
+        # кэш при выборе (см. handle_chosen_inline) и в следующий раз тоже станут
+        # мгновенными gif. Так выдача сходится к поведению @memer.
+        text_hash = _text_hash(overlay_text)
+        anim_ids = [str(t["id"]) for t in templates if t["file_type"] == "animation"]
+        cached_map = await get_cached_gif_batch(pool, anim_ids, text_hash) if anim_ids else {}
+        for tpl in templates:
+            cached_fid = cached_map.get(str(tpl["id"])) if tpl["file_type"] == "animation" else None
+            if cached_fid:
+                results.append(_build_cached_gif_result(tpl, cached_fid, overlay_text, placement, next_label))
+            else:
+                results.append(_build_preview_result(tpl, overlay_text, placement, next_label))
+    else:
+        for tpl in templates:
             results.append(_build_plain_result(tpl, placement, next_label))
 
     # While typing overlay text, force fresh results (cache_time=0) so the preview never
@@ -279,19 +320,32 @@ async def handle_chosen_inline(result: ChosenInlineResult, bot: Bot):
         gif_id=str(template_id) if template_id is not None else raw,
     )
 
-    # Подмена статичного превью на живую гифку. В выдаче мы показываем дешёвые JPEG
-    # (иначе Телеграм роняет почти все результаты, см. _build_preview_result). Когда юзер
-    # ВЫБРАЛ результат — это уже одна гифка, её и рендерим: правим inline-сообщение на
-    # анимацию. Текст берём из result.query (в result_id лежит только хэш).
-    if template_id is None or not result.inline_message_id:
+    if template_id is None:
         return
     _, overlay_text = parse_inline_query(result.query or "")
     if not overlay_text:
-        # Без текста результат и так был анимацией (cached file_id) — подменять нечего.
+        # Без текста результат и так был готовой анимацией (cached file_id) — ничего не делаем.
         return
     try:
         template = await get_template(pool, template_id)
         if not template or template.get("file_type") != "animation":
+            return
+        text_hash = _text_hash(overlay_text)
+        cached = await get_cached_gif(pool, str(template_id), text_hash)
+        if cached:
+            # Этот (шаблон, текст) уже в кэше → в выдаче он был отдан ГОТОВОЙ gif
+            # (CachedMpeg4Gif). Улетело сразу анимацией, править нечего — а значит
+            # НЕТ пометки «изменено». Это и есть целевое поведение.
+            return
+
+        # Не было в кэше → в выдаче показали статичное превью. Заливаем эту gif в
+        # кэш-канал В ФОНЕ, чтобы СЛЕДУЮЩИЙ раз этот же текст отдавался мгновенной
+        # gif без правки и без «изменено». А текущее сообщение разово подменяем на
+        # анимацию (только здесь, на самом первом использовании текста, мелькнёт
+        # «изменено» — до gif ещё физически не существует, деться от этого некуда).
+        _spawn_bg(_upload_one(bot, pool, template, overlay_text, text_hash))
+
+        if not result.inline_message_id:
             return
         placement = await get_placement(pool, placement_id) if placement_id else None
         caption = placement["caption_text"] if placement and placement.get("caption_text") else None
