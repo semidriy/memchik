@@ -1031,6 +1031,16 @@ _MSG_DEFAULTS: dict[str, str] = {
         "⚡ <b>Быстро (только для вас)</b> — сразу доступен, не проходит модерацию.\n\n"
         "🌐 <b>Публичный</b> — проходит модерацию, после одобрения виден всем."
     ),
+    # Тексты, которые показываются ПОСЛЕ выбора способа. У каждой кнопки чузера свой,
+    # редактируются отдельно в разделе «Сообщения» (и «Языки») — раньше был один общий
+    # tpl.send_media на обе кнопки, из-за чего «оба ведут в одно место».
+    "tpl.send_media_quick": (
+        "⚡ Пришли GIF, видео или фото — добавлю шаблон лично для тебя, без модерации."
+    ),
+    "tpl.send_media_public": (
+        "🌐 Пришли GIF, видео или фото для публичного шаблона.\n"
+        "После модерации его увидят все пользователи."
+    ),
 }
 
 _BTN_DEFAULTS: dict[str, list] = {
@@ -1086,6 +1096,13 @@ _MSG_DEFAULTS_EN: dict[str, str] = {
         "🖼 How do you want to add a template?\n\n"
         "⚡ <b>Quick (only for you)</b> — available instantly, no moderation.\n\n"
         "🌐 <b>Public</b> — goes through moderation, visible to everyone once approved."
+    ),
+    "tpl.send_media_quick": (
+        "⚡ Send a GIF, video or photo — I'll add it just for you, no moderation."
+    ),
+    "tpl.send_media_public": (
+        "🌐 Send a GIF, video or photo for a public template.\n"
+        "Once approved by moderation, everyone will see it."
     ),
 }
 

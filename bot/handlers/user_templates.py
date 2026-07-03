@@ -46,8 +46,12 @@ logger = logging.getLogger(__name__)
 
 
 def _cancel_kb(label: str) -> InlineKeyboardMarkup:
+    # «Назад» на промежуточных шагах добавления (пришли медиа / пришли теги) ведёт
+    # НАЗАД к чузеру (экран выбора способа), а не в главное меню — клиент жаловался,
+    # что «отмена кидает в меню, а не обратно в добавление». Терминальные экраны
+    # (успех/ошибка/дубликат) используют прямой utpl:cancel → в главное меню.
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=label, callback_data="utpl:cancel")],
+        [InlineKeyboardButton(text=label, callback_data="utpl:back")],
     ])
 
 
@@ -97,6 +101,49 @@ async def _replace_panel(bot, chat_id: int, old_mid: int, text: str, kb,
     if state is not None:
         await state.update_data(pm_cid=sent.chat.id, pm_mid=sent.message_id)
     return sent
+
+
+async def _show_bot_message_panel(bot, chat_id: int, old_mid: int, msg: dict, kb,
+                                  fallback_text: str, state: FSMContext = None):
+    """Показать редактируемую менюшку (bot_messages: текст+энтити+медиа) как текущую
+    панель. Если у менюшки есть медиа — удаляем старое сообщение и шлём медиа+подпись
+    (текстом медиа не отредактировать). Иначе редактируем текст на месте. Используется
+    для промптов после выбора способа (tpl.send_media_quick / _public) — у каждой кнопки
+    свой текст, и его можно снабдить видео/гиф/прем-эмодзи в админке."""
+    text = msg.get("text") or fallback_text
+    ents = None
+    if msg.get("entities"):
+        ents = [MessageEntity(**{k: v for k, v in e.items()}) for e in msg["entities"]]
+    fid, ftype = msg.get("file_id"), msg.get("file_type")
+    if not fid:
+        await _replace_panel(bot, chat_id, old_mid, text, kb, entities=ents, state=state)
+        return
+    try:
+        await bot.delete_message(chat_id, old_mid)
+    except Exception:
+        pass
+    for attempt_ents in ([ents, None] if ents else [None]):
+        kw = {"caption": text or None, "reply_markup": kb}
+        if attempt_ents:
+            kw["caption_entities"] = attempt_ents
+            kw["parse_mode"] = None
+        else:
+            kw["parse_mode"] = "HTML"
+        try:
+            if ftype == "video":
+                sent = await bot.send_video(chat_id, fid, **kw)
+            elif ftype == "photo":
+                sent = await bot.send_photo(chat_id, fid, **kw)
+            else:
+                sent = await bot.send_animation(chat_id, fid, **kw)
+            if state is not None:
+                await state.update_data(pm_cid=sent.chat.id, pm_mid=sent.message_id)
+            return
+        except Exception as e:
+            logger.warning("send_media panel failed (ents=%s): %s", bool(attempt_ents), e)
+    sent = await bot.send_message(chat_id, text, reply_markup=kb)
+    if state is not None:
+        await state.update_data(pm_cid=sent.chat.id, pm_mid=sent.message_id)
 
 
 async def _send_chooser(message: Message, lang: str, edit_from: Message | None = None) -> Message:
@@ -208,12 +255,29 @@ async def cb_choose_type(callback: CallbackQuery, state: FSMContext):
         return
 
     await state.set_state(UserTemplateStates.waiting_media)
-    await _replace_panel(
+    # У каждой кнопки чузера свой отдельный текст-промпт (быстро vs публичный),
+    # редактируется в «Сообщениях»/«Языках». Раньше обе кнопки показывали один общий
+    # tpl.send_media → клиент видел «оба ведут в одно место».
+    msg_key = "tpl.send_media_public" if is_public else "tpl.send_media_quick"
+    msg = await get_bot_message(get_pool(), msg_key, lang)
+    await _show_bot_message_panel(
         callback.bot, callback.message.chat.id, callback.message.message_id,
-        await t("tpl.send_media", lang),
-        _cancel_kb(await t("common.cancel", lang)),
-        state=state,
+        msg, _cancel_kb(await t("common.back", lang)),
+        await t("tpl.send_media", lang), state=state,
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "utpl:back")
+async def cb_back_to_chooser(callback: CallbackQuery, state: FSMContext):
+    """«Назад» с шага добавления → возврат к чузеру (выбор способа), не в главное меню.
+    Сбрасываем недозаполненные данные, чтобы чузер открылся чистым (иначе оставшийся
+    file_id мог бы тут же «доотправить» шаблон)."""
+    lang = await user_lang(callback.from_user.id)
+    await state.clear()
+    await state.set_state(UserTemplateStates.choosing_type)
+    sent = await _send_chooser(callback.message, lang, edit_from=callback.message)
+    await state.update_data(pm_cid=sent.chat.id, pm_mid=sent.message_id)
     await callback.answer()
 
 
@@ -258,7 +322,7 @@ async def _process_chosen_media(bot, user_id: int, state: FSMContext, lang: str)
         await _replace_panel(
             bot, pm_cid, pm_mid,
             await t("tpl.send_tags", lang),
-            _cancel_kb(await t("common.cancel", lang)),
+            _cancel_kb(await t("common.back", lang)),
             state=state,
         )
         return
@@ -393,7 +457,7 @@ async def handle_user_media(message: Message, state: FSMContext):
         await _replace_panel(
             message.bot, data["pm_cid"], data["pm_mid"],
             await t("tpl.send_tags", lang),
-            _cancel_kb(await t("common.cancel", lang)),
+            _cancel_kb(await t("common.back", lang)),
             state=state,
         )
         return
@@ -459,7 +523,7 @@ async def handle_user_tags(message: Message, state: FSMContext):
         await _replace_panel(
             message.bot, data["pm_cid"], data["pm_mid"],
             await t("tpl.tags_invalid", lang),
-            _cancel_kb(await t("common.cancel", lang)),
+            _cancel_kb(await t("common.back", lang)),
             state=state,
         )
         return

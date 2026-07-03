@@ -34,7 +34,7 @@ router = Router()
 # Keys that belong to bot_messages (long texts), not i18n_strings.
 # settings/premium включены, чтобы тексты этих менюшек (с прем-эмодзи) тоже
 # редактировались по каждому языку, а не только главное меню.
-_BOT_MESSAGE_KEYS = ["welcome", "op_required", "op_passed", "meme_send_text", "settings", "premium", "tpl.add_choose_type"]
+_BOT_MESSAGE_KEYS = ["welcome", "op_required", "op_passed", "meme_send_text", "settings", "premium", "tpl.add_choose_type", "tpl.send_media_quick", "tpl.send_media_public"]
 _PAGE_SIZE = 10
 
 
@@ -225,6 +225,8 @@ def _key_hint(k: str) -> str:
             "settings": "Заголовок меню настроек",
             "premium": "Текст меню Premium",
             "tpl.add_choose_type": "Экран «как добавить шаблон»",
+            "tpl.send_media_quick": "Текст после «Быстро добавить»",
+            "tpl.send_media_public": "Текст после «Публичный шаблон»",
         }
         return labels.get(k, "")
     short = val.replace("\n", " ").replace("<b>", "").replace("</b>", "")
