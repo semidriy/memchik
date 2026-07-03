@@ -78,6 +78,10 @@ async def _replace_panel(bot, chat_id: int, old_mid: int, text: str, kb,
     kw = {"reply_markup": kb}
     if entities:
         kw["entities"] = entities
+        # parse_mode=None ОБЯЗАТЕЛЕН: у бота глобальный дефолт parse_mode=HTML, и без
+        # явного сброса Телеграм парсит текст как HTML и ИГНОРИРУЕТ entities — из-за
+        # этого пропадали формат (жирный и т.п.) и прем-эмодзи в промптах после кнопок.
+        kw["parse_mode"] = None
     else:
         kw["parse_mode"] = parse_mode
     if old_mid:
